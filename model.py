@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torchaudio.models import Conformer
 from utils import CHARSET
-
+#test
 
 class GigachadVoice(nn.Module):
     def __init__(self, charset=CHARSET):
