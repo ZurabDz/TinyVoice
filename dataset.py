@@ -6,6 +6,7 @@ import pandas as pd
 import os.path as osp
 import torchaudio.transforms as T
 import re
+from torchaudio.transforms import TimeStretch, FrequencyMasking, TimeMasking
 
 from utils import from_text
 
@@ -37,11 +38,12 @@ class CommonVoiceDataset(Dataset):
         self.sample_rate, self.win_length, self.hop_length, n_mels=80)
         self.audio_df = self.__create_dataset()
 
-        self.transforms = nn.Sequential(
-            # 80 is the full thing
-            torchaudio.transforms.FrequencyMasking(freq_mask_param=15),
-            # 256 is the hop size, so 86 is one second
-            torchaudio.transforms.TimeMasking(time_mask_param=35)
+        self.stretch_factor = 0.8
+
+        self.spec_aug = nn.Sequential(
+            TimeStretch(self.stretch_factor, fixed_rate=True),
+            FrequencyMasking(freq_mask_param=15),
+            # TimeMasking(time_mask_param=5),
         )
 
     def __create_dataset(self):
@@ -64,5 +66,9 @@ class CommonVoiceDataset(Dataset):
     def __getitem__(self, index):
         audio_path, label = self.audio_df[index]
         audio_features = self.__featurise_audio(osp.join(self.root_dir, 'clips', audio_path))
+
+        if self.split == 'train':
+            audio_features = self.spec_aug(audio_features)
+
         label = re.sub(r'[^ა-ჰ ]+', '', label)
         return audio_features, label
