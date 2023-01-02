@@ -1,48 +1,44 @@
-import torch
 import torch.nn as nn
-from torchaudio.models import Conformer
-from utils import CHARSET
-#test
+from torchaudio.models.conformer import Conformer
+import pytorch_lightning as pl
+import torch
 
-class GigachadVoice(nn.Module):
-    def __init__(self, charset=CHARSET):
+class MiniatureVoice(pl.LightningModule):
+    def __init__(self):
         super().__init__()
-
-        self.charset = charset
-
-        C = 64
-
-        self.encode = nn.Sequential(
-            nn.Conv2d(1, C, kernel_size=3, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(C, C, kernel_size=3, stride=2),
-            nn.ReLU()
+        H = 80
+        self.encoder = Conformer(input_dim=H, num_heads=4, ffn_dim=128, num_layers=4, depthwise_conv_kernel_size=31)
+        self.decoder = nn.Sequential(
+            nn.Dropout(0.15),
+            nn.Linear(H, 34)
         )
+        self.criterion = nn.CTCLoss()
 
-        H = 144
+    def forward(self, input, lengths):
+        encoder_outs, encoder_outs_length = self.encoder(input, lengths)
+        output = self.decoder(encoder_outs)
+        output = nn.functional.log_softmax(output, dim=-1)
+        return output, encoder_outs_length
 
-        self.linear = nn.Sequential(
-            nn.Linear(C*(((80 - 1) // 2 - 1) // 2), H),
-            nn.Dropout(0.1)
-        )
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-5)
+        return optimizer
 
-        self.conformer = Conformer(
-            input_dim=H, num_heads=4, ffn_dim=H * 4, num_layers=16, depthwise_conv_kernel_size=31)
+    def training_step(self, train_batch, batch_idx):
+        features, labels, features_lengths, labels_lengths = train_batch
+        output, output_lengths = self.encoder(features, features_lengths)
 
-        self.decode = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(H, len(self.charset))
-        )
+        output = self.decoder(output)
+        loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
 
-    def forward(self, x, y):
-        x = self.encode(x)
-        x = x.permute(0, 2, 1, 3)
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        y = (y >> 2) - 1
-        x = x[:, :torch.max(y)]
-        x = self.linear(x)
+        return loss
 
-        x, zz = self.conformer(x, y)
-        x = self.decode(x).reshape(x.shape[0], x.shape[1], len(self.charset))
 
-        return torch.nn.functional.log_softmax(x, dim=2).permute(1, 0, 2), zz
+    def validation_step(self, valid_batch, batch_idx):
+        features, labels, features_lengths, labels_lengths = valid_batch
+        output, output_lengths = self.encoder(features, features_lengths)
+
+        output = self.decoder(output)
+        loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
+
+        self.log('train_loss', loss)
