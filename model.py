@@ -26,9 +26,8 @@ class MiniatureVoice(pl.LightningModule):
 
     def training_step(self, train_batch, batch_idx):
         features, labels, features_lengths, labels_lengths = train_batch
-        output, output_lengths = self.encoder(features, features_lengths)
-
-        output = self.decoder(output)
+        output, output_lengths = self.forward(features, features_lengths)
+        
         loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
 
         return loss
