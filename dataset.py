@@ -7,6 +7,7 @@ import os.path as osp
 import torchaudio.transforms as T
 import re
 from torchaudio.transforms import TimeStretch, FrequencyMasking, TimeMasking
+from random import randint
 
 from utils import from_text
 
@@ -68,7 +69,8 @@ class CommonVoiceDataset(Dataset):
         audio_features = self.__featurise_audio(osp.join(self.root_dir, 'clips', audio_path))
 
         if self.split == 'train':
-            audio_features = self.spec_aug(audio_features)
+            if randint(1, 10) < 4:
+                audio_features = self.spec_aug(audio_features)
 
         label = re.sub(r'[^ა-ჰ ]+', '', label)
         return audio_features, label
