@@ -29,7 +29,7 @@ class CommonVoiceDataModule(pl.LightningDataModule):
             pass
 
     def train_dataloader(self):
-        return DataLoader(self.common_voice_train, batch_size=4,num_workers=6, collate_fn=custom_collate_fn)
+        return DataLoader(self.common_voice_train, batch_size=4,num_workers=6, collate_fn=custom_collate_fn, shuffle=True)
 
     def val_dataloader(self):
         return DataLoader(self.common_voice_valid, batch_size=4,num_workers=6, collate_fn=custom_collate_fn)
