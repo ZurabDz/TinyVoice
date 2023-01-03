@@ -2,6 +2,9 @@ import torch.nn as nn
 from torchaudio.models.conformer import Conformer
 import pytorch_lightning as pl
 import torch
+from utils import to_text
+from jiwer import wer
+
 
 class MiniatureVoice(pl.LightningModule):
     def __init__(self):
@@ -21,8 +24,12 @@ class MiniatureVoice(pl.LightningModule):
         return output, encoder_outs_length
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-5)
-        return optimizer
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-5, weight_decay=0.0004)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+
+        return [optimizer], [scheduler]
+        # return optimizer
+
 
     def training_step(self, train_batch, batch_idx):
         features, labels, features_lengths, labels_lengths = train_batch
@@ -30,14 +37,40 @@ class MiniatureVoice(pl.LightningModule):
         
         loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
 
+        self.log('train', loss)
+
         return loss
 
 
     def validation_step(self, valid_batch, batch_idx):
         features, labels, features_lengths, labels_lengths = valid_batch
-        output, output_lengths = self.encoder(features, features_lengths)
+        output, output_lengths = self.forward(features, features_lengths)
 
-        output = self.decoder(output)
         loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
 
-        self.log('train_loss', loss)
+        hypothesis = [to_text(e) for e in output.argmax(-1)]
+
+        self.log('valid_loss', loss)
+        print(hypothesis)
+
+
+    def early_stopping_checkpoint(self):
+        # Save a checkpoint at every epoch
+        return {
+            'epoch': self.current_epoch,
+            'state_dict': self.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict()
+        }
+    
+    def on_valid_epoch_end(self):
+        # Compare current validation loss to the best so far
+        if self.current_epoch == 0:
+            self.best_loss = float('inf')
+        else:
+            if self.current_validation_loss < self.best_loss:
+                self.best_loss = self.current_validation_loss
+            else:
+                # If validation loss has increased, stop training
+                print(f'Validation loss increased, stopping training at epoch {self.current_epoch}')
+                self.trainer.should_stop = True
