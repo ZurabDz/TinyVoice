@@ -11,23 +11,6 @@ class CommonVoiceDataModule(pl.LightningDataModule):
         self.common_voice_valid = CommonVoiceDataset('data/cv-corpus-12.0-2022-12-07/ka/', 'dev') 
         self.common_voice_test = CommonVoiceDataset('data/cv-corpus-12.0-2022-12-07/ka/', 'test')
 
-    def prepare_data(self):
-        # download
-        pass
-
-    def setup(self, stage: str):
-
-        # Assign train/val datasets for use in dataloaders
-        if stage == "fit":
-            pass
-
-        # Assign test dataset for use in dataloader(s)
-        if stage == "test":
-            pass
-
-        if stage == "predict":
-            pass
-
     def train_dataloader(self):
         return DataLoader(self.common_voice_train, batch_size=4,num_workers=6, collate_fn=custom_collate_fn, shuffle=True)
 
