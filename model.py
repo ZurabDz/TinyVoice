@@ -49,9 +49,11 @@ class MiniatureVoice(pl.LightningModule):
         loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
 
         hypothesis = [to_text(e) for e in output.argmax(-1)]
+        ground_truth = [to_text(e) for e in labels]
+
 
         self.log('valid_loss', loss)
-        print(hypothesis)
+        self.log('valid_wer', wer(ground_truth, hypothesis))
 
 
     def early_stopping_checkpoint(self):
