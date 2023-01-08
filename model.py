@@ -7,13 +7,14 @@ from jiwer import wer
 
 
 class MiniatureVoice(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, num_classes: int = 34):
         super().__init__()
-        H = 80
-        self.encoder = Conformer(input_dim=H, num_heads=4, ffn_dim=128, num_layers=4, depthwise_conv_kernel_size=31)
+        self.H = 80
+        self.num_classes = num_classes
+        self.encoder = Conformer(input_dim=self.H, num_heads=4, ffn_dim=128, num_layers=4, depthwise_conv_kernel_size=31)
         self.decoder = nn.Sequential(
             nn.Dropout(0.15),
-            nn.Linear(H, 34)
+            nn.Linear(self.H, self.num_classes)
         )
         self.criterion = nn.CTCLoss()
 
