@@ -5,7 +5,7 @@ from pytorch_lightning.strategies import DeepSpeedStrategy
 
 
 model = MiniatureVoice()
-data_module = CommonVoiceDataModule()
+data_module = CommonVoiceDataModule('data/cv-corpus-12.0-2022-12-07/ka')
 
 
 trainer = pl.Trainer(accelerator='gpu', gradient_clip_val=1, max_epochs=50, precision=16
