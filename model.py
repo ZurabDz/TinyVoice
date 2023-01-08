@@ -20,7 +20,7 @@ class MiniatureVoice(pl.LightningModule):
     def forward(self, input, lengths):
         encoder_outs, encoder_outs_length = self.encoder(input, lengths)
         output = self.decoder(encoder_outs)
-        output = nn.functional.log_softmax(output, dim=-1)
+        output = nn.functional.log_softmax(output, dim=-1, dtype=torch.float32)
         return output, encoder_outs_length
 
     def configure_optimizers(self):

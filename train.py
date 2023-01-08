@@ -8,7 +8,7 @@ model = MiniatureVoice()
 data_module = CommonVoiceDataModule()
 
 
-trainer = pl.Trainer(accelerator='gpu', gradient_clip_val=1, max_epochs=50, 
+trainer = pl.Trainer(accelerator='gpu', gradient_clip_val=1, max_epochs=50, precision=16
 # strategy=DeepSpeedStrategy(
         # stage=3,
         # offload_optimizer=True,
