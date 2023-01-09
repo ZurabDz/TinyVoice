@@ -11,15 +11,21 @@ class CommonVoiceDataModule(pl.LightningDataModule):
         super().__init__()
         if isinstance(root_dir, Path):
             self.root_dir = str(root_dir)
+
+        self.batch_size = batch_size
+        self.num_workers = num_workers
         self.common_voice_train = CommonVoiceDataset(root_dir, 'train')
         self.common_voice_valid = CommonVoiceDataset(root_dir, 'dev') 
         self.common_voice_test = CommonVoiceDataset(root_dir, 'test')
 
     def train_dataloader(self):
-        return DataLoader(self.common_voice_train, batch_size=4,num_workers=6, collate_fn=custom_collate_fn, shuffle=True)
+        return DataLoader(self.common_voice_train, batch_size=self.batch_size,
+         num_workers=self.num_workers, collate_fn=custom_collate_fn, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.common_voice_valid, batch_size=4,num_workers=6, collate_fn=custom_collate_fn)
+        return DataLoader(self.common_voice_valid, batch_size=self.batch_size,
+         num_workers=self.num_workers, collate_fn=custom_collate_fn)
 
     def test_dataloader(self):
-        return DataLoader(self.common_voice_test, batch_size=4,num_workers=6, collate_fn=custom_collate_fn)
+        return DataLoader(self.common_voice_test, batch_size=self.batch_size,
+         num_workers=self.num_workers, collate_fn=custom_collate_fn)
