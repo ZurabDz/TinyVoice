@@ -4,6 +4,8 @@ import pytorch_lightning as pl
 import torch
 from utils import to_text
 from jiwer import wer
+from torch.optim.lr_scheduler import LambdaLR
+from loss import SquaredCTCLoss
 
 
 class MiniatureVoice(pl.LightningModule):
@@ -11,12 +13,15 @@ class MiniatureVoice(pl.LightningModule):
         super().__init__()
         self.H = 80
         self.num_classes = num_classes
-        self.encoder = Conformer(input_dim=self.H, num_heads=4, ffn_dim=128, num_layers=4, depthwise_conv_kernel_size=31)
+        self.encoder = Conformer(input_dim=self.H, num_heads=5, ffn_dim=512, num_layers=8, depthwise_conv_kernel_size=31)
         self.decoder = nn.Sequential(
             nn.Dropout(0.15),
             nn.Linear(self.H, self.num_classes)
         )
-        self.criterion = nn.CTCLoss()
+        # self.criterion = nn.CTCLoss()
+        self.criterion = SquaredCTCLoss()
+        self.warmup_steps = 100
+        self.current_step = 0
 
     def forward(self, input, lengths):
         encoder_outs, encoder_outs_length = self.encoder(input, lengths)
@@ -26,8 +31,8 @@ class MiniatureVoice(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=1e-5, weight_decay=0.0004)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
-
+        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10,)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step : min(1, step / self.warmup_steps))
         return [optimizer], [scheduler]
         # return optimizer
 
@@ -49,12 +54,12 @@ class MiniatureVoice(pl.LightningModule):
 
         loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
 
-        hypothesis = [to_text(e) for e in output.argmax(-1)]
-        ground_truth = [to_text(e) for e in labels]
+        # hypothesis = [to_text(e) for e in output.argmax(-1)]
+        # ground_truth = [to_text(e) for e in labels]
 
 
         self.log('valid_loss', loss)
-        self.log('valid_wer', wer(ground_truth, hypothesis))
+        # self.log('valid_wer', wer(ground_truth, hypothesis))
 
 
     def early_stopping_checkpoint(self):
