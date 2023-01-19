@@ -13,7 +13,8 @@ class MiniatureVoice(pl.LightningModule):
         super().__init__()
         self.H = 80
         self.num_classes = num_classes
-        self.encoder = Conformer(input_dim=self.H, num_heads=5, ffn_dim=512, num_layers=8, depthwise_conv_kernel_size=31)
+        self.encoder = Conformer(input_dim=self.H, num_heads=5,
+                                 ffn_dim=512, num_layers=8, depthwise_conv_kernel_size=31)
         self.decoder = nn.Sequential(
             nn.Dropout(0.15),
             nn.Linear(self.H, self.num_classes)
@@ -30,37 +31,37 @@ class MiniatureVoice(pl.LightningModule):
         return output, encoder_outs_length
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-5, weight_decay=0.0004)
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=1e-5, weight_decay=0.0004)
         # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10,)
-        scheduler = LambdaLR(optimizer, lr_lambda=lambda step : min(1, step / self.warmup_steps))
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: min(
+            1, step / self.warmup_steps))
         return [optimizer], [scheduler]
         # return optimizer
-
 
     def training_step(self, train_batch, batch_idx):
         features, labels, features_lengths, labels_lengths = train_batch
         output, output_lengths = self.forward(features, features_lengths)
-        
-        loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
+
+        loss = self.criterion(output.transpose(
+            0, 1), labels, output_lengths, labels_lengths)
 
         self.log('train', loss)
 
         return loss
 
-
     def validation_step(self, valid_batch, batch_idx):
         features, labels, features_lengths, labels_lengths = valid_batch
         output, output_lengths = self.forward(features, features_lengths)
 
-        loss = self.criterion(output.transpose(0, 1), labels, output_lengths, labels_lengths)
+        loss = self.criterion(output.transpose(
+            0, 1), labels, output_lengths, labels_lengths)
 
         # hypothesis = [to_text(e) for e in output.argmax(-1)]
         # ground_truth = [to_text(e) for e in labels]
 
-
         self.log('valid_loss', loss)
         # self.log('valid_wer', wer(ground_truth, hypothesis))
-
 
     def early_stopping_checkpoint(self):
         # Save a checkpoint at every epoch
@@ -70,7 +71,7 @@ class MiniatureVoice(pl.LightningModule):
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict()
         }
-    
+
     def on_valid_epoch_end(self):
         # Compare current validation loss to the best so far
         if self.current_epoch == 0:
@@ -80,5 +81,6 @@ class MiniatureVoice(pl.LightningModule):
                 self.best_loss = self.current_validation_loss
             else:
                 # If validation loss has increased, stop training
-                print(f'Validation loss increased, stopping training at epoch {self.current_epoch}')
+                print(
+                    f'Validation loss increased, stopping training at epoch {self.current_epoch}')
                 self.trainer.should_stop = True

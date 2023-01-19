@@ -12,7 +12,6 @@ from random import randint
 from utils import from_text
 
 
-
 def custom_collate_fn(batch):
     features = [feature for feature, _ in batch]
     labels = [torch.tensor(from_text(label)) for _, label in batch]
@@ -23,7 +22,7 @@ def custom_collate_fn(batch):
     features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True)
     labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True)
 
-    return features, labels, torch.tensor(features_lengths), torch.tensor(labels_lengths)  
+    return features, labels, torch.tensor(features_lengths), torch.tensor(labels_lengths)
 
 
 class CommonVoiceDataset(Dataset):
@@ -36,7 +35,7 @@ class CommonVoiceDataset(Dataset):
         self.hop_length = int(self.sample_rate/(1000/10))
         self.win_length = int(self.sample_rate/(1000/25))
         self.featuriser = torchaudio.transforms.MelSpectrogram(
-        self.sample_rate, self.win_length, self.hop_length, n_mels=80)
+            self.sample_rate, self.win_length, self.hop_length, n_mels=80)
         self.audio_df = self.__create_dataset()
 
         self.stretch_factor = 0.8
@@ -66,7 +65,8 @@ class CommonVoiceDataset(Dataset):
 
     def __getitem__(self, index):
         audio_path, label = self.audio_df[index]
-        audio_features = self.__featurise_audio(osp.join(self.root_dir, 'clips', audio_path))
+        audio_features = self.__featurise_audio(
+            osp.join(self.root_dir, 'clips', audio_path))
 
         if self.split == 'train':
             if randint(1, 10) < 4:
