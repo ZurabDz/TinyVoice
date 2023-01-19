@@ -17,6 +17,10 @@ parser.add_argument('--max_epochs', required=True, type=int)
 parser.add_argument('--check_val_every_n_epochs', required=True, type=int)
 parser.add_argument('--accumulate_grad_batches', required=True, type=int)
 
+parser.add_argument('--num_heads', required=True, type=int)
+parser.add_argument('--ffn_dim', required=True, type=int)
+parser.add_argument('--num_layers', required=True, type=int)
+
 
 args = parser.parse_args()
 
