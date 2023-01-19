@@ -5,17 +5,17 @@ from pytorch_lightning.strategies import DeepSpeedStrategy
 # import composer.functional as cf
 from argparse import ArgumentParser
 
-
+ 
 parser = ArgumentParser(
     prog="Train Miniature Voice",
     description="configurtion miniature voice and training it",
 )
 
-parser.add_argument('--root_data', help="common voice dataset root dir")
-parser.add_argument('--batch_size')
-parser.add_argument('--max_epochs')
-parser.add_argument('--check_val_every_n_epochs')
-parser.add_argument('--accumulate_grad_batches')
+parser.add_argument('--root_data', help="common voice dataset root dir", required=True)
+parser.add_argument('--batch_size', required=True, type=int)
+parser.add_argument('--max_epochs', required=True, type=int)
+parser.add_argument('--check_val_every_n_epochs', required=True, type=int)
+parser.add_argument('--accumulate_grad_batches', required=True, type=int)
 
 
 args = parser.parse_args()

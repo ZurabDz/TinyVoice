@@ -2,19 +2,22 @@ import torch.nn as nn
 from torchaudio.models.conformer import Conformer
 import pytorch_lightning as pl
 import torch
-from utils import to_text
+from .utils import to_text
 from jiwer import wer
 from torch.optim.lr_scheduler import LambdaLR
-from loss import SquaredCTCLoss
+from .loss import SquaredCTCLoss
 
 
 class MiniatureVoice(pl.LightningModule):
-    def __init__(self, num_classes: int = 34):
+    def __init__(self, num_classes: int = 34, num_heads: int = 5, ffn_dim: int = 512, num_layers: int = 8):
         super().__init__()
         self.H = 80
+        self.num_heads = num_heads
+        self.ffn_dim = ffn_dim
+        self.num_layers = num_layers
         self.num_classes = num_classes
-        self.encoder = Conformer(input_dim=self.H, num_heads=5,
-                                 ffn_dim=512, num_layers=8, depthwise_conv_kernel_size=31)
+        self.encoder = Conformer(input_dim=self.H, num_heads=self.num_heads,
+                                 ffn_dim=self.ffn_dim, num_layers=self.num_layers, depthwise_conv_kernel_size=31)
         self.decoder = nn.Sequential(
             nn.Dropout(0.15),
             nn.Linear(self.H, self.num_classes)

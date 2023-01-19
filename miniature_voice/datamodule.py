@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
-from dataset import CommonVoiceDataset
+from .dataset import CommonVoiceDataset
 from torch.utils.data import DataLoader
-from dataset import custom_collate_fn
+from .dataset import custom_collate_fn
 from typing import Union, Optional
 from pathlib import Path
 

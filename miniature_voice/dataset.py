@@ -9,7 +9,7 @@ import re
 from torchaudio.transforms import TimeStretch, FrequencyMasking, TimeMasking
 from random import randint
 
-from utils import from_text
+from .utils import from_text
 
 
 def custom_collate_fn(batch):
