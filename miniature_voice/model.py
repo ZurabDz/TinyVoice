@@ -22,8 +22,8 @@ class MiniatureVoice(pl.LightningModule):
             nn.Dropout(0.15),
             nn.Linear(self.H, self.num_classes)
         )
-        # self.criterion = nn.CTCLoss()
-        self.criterion = SquaredCTCLoss()
+        self.criterion = nn.CTCLoss()
+        # self.criterion = SquaredCTCLoss()
         self.warmup_steps = 100
         self.current_step = 0
 
