@@ -19,18 +19,18 @@ parser.add_argument('--accumulate_grad_batches', required=True, type=int)
 parser.add_argument('--num_heads', required=True, type=int)
 parser.add_argument('--ffn_dim', required=True, type=int)
 parser.add_argument('--num_layers', required=True, type=int)
+parser.add_argument('--precision', type=int)
 
 
 args = parser.parse_args()
 
-model = MiniatureVoice(num_heads=args.num_heads, ffn_dim=args.ffn_dim, num_layers=args.num_layers)
+model = MiniatureVoice(num_heads=args.num_heads, ffn_dim=args.ffn_dim, num_layers=args.num_layers, input_dim=80)
 
 
 data_module = CommonVoiceDataModule(args.root_data, batch_size=args.batch_size)
 
-
 trainer = pl.Trainer(accelerator='gpu', gradient_clip_val=1, max_epochs=args.max_epochs,
-                     precision=16, check_val_every_n_epoch=args.check_val_every_n_epochs,
+                     precision=args.precision, check_val_every_n_epoch=args.check_val_every_n_epochs,
                      accumulate_grad_batches=args.accumulate_grad_batches,
                      # strategy='deepspeed'
                      # strategy=DeepSpeedStrategy(
