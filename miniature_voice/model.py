@@ -9,7 +9,7 @@ from .loss import SquaredCTCLoss
 
 
 class MiniatureVoice(pl.LightningModule):
-    def __init__(self, num_classes: int = 34, num_heads: int = 5, ffn_dim: int = 512, num_layers: int = 8, input_dim: int = 128):
+    def __init__(self, num_classes: int = 34, num_heads: int = 5, ffn_dim: int = 512, num_layers: int = 8, input_dim: int = 80):
         super().__init__()
         self.H = input_dim
         self.num_heads = num_heads

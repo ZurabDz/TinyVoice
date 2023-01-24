@@ -14,9 +14,9 @@ class CommonVoiceDataModule(pl.LightningDataModule):
 
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.common_voice_train = CommonVoiceDataset(root_dir, 'train')
-        self.common_voice_valid = CommonVoiceDataset(root_dir, 'dev')
-        self.common_voice_test = CommonVoiceDataset(root_dir, 'test')
+        self.common_voice_train = CommonVoiceDataset(root_dir, 'train', n_mels=80)
+        self.common_voice_valid = CommonVoiceDataset(root_dir, 'dev', n_mels=80)
+        self.common_voice_test = CommonVoiceDataset(root_dir, 'test', n_mels=80)
         self.custom_collate_fn = MyCollator(root_dir)
 
     def train_dataloader(self):
