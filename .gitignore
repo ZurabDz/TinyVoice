@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-data/*
-=======
 # pixi environments
 .pixi/*
 !.pixi/config.toml
 **/__pycache__/
->>>>>>> 2edb45c (configs)
