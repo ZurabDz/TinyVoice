@@ -8,8 +8,8 @@
 ## TODOS
 
 - [ ] avoiding train step jit recompilation with fixed shaped inputs
-    - [ ] padding each audios to some magic MAX_LENGTH
-    - [ ] padding each labels to some magic MAX_LENGTH
+    - [x] padding each audios to some magic MAX_LENGTH
+    - [x] padding each labels to some magic MAX_LENGTH
     - [ ] explore option to precompile on multiple shapes? at least will have multiple magic MAX_LENGTHES?
 - [ ] actually running a training
     - [ ] simply try it out on ASR first
