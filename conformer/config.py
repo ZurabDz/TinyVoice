@@ -29,7 +29,7 @@ class SpecAugmentConfig:
 @dataclass
 class ConformerConfig:
     input_dim: int = 80
-    num_encoder_layers: int = 1
+    num_encoder_layers: int = 4
     encoder_dim: int = 144
     num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 4
