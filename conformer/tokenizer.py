@@ -25,18 +25,15 @@ class Tokenizer:
         return "".join(decoded_chars)
 
 
-def build_tokenizer(root_path):
+def build_tokenizer(data):
     def get_common_voice_vocab(dataset):
         # build vocabulary from training data
-        text = " ".join([item[1] for item in dataset])
+        text = " ".join([label for label in dataset])
         vocab = sorted(list(set(text.lower())))
         vocab = ['<pad>', '<unk>'] + vocab
         print(f"Vocabulary size: {len(vocab)}")
         return vocab
 
-    reader = csv.DictReader(open(osp.join(root_path, 'train.tsv')), delimiter='\t')
-    data = [(osp.join(root_path, 'clips', entry['path']),
-             entry['sentence']) for entry in reader]
     vocab = get_common_voice_vocab(data)
     return Tokenizer(vocab)
 

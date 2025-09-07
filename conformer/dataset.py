@@ -1,5 +1,5 @@
-import csv
-import os.path as osp
+import pandas as pd
+from pathlib import Path
 import librosa
 import numpy as np
 import jax.numpy as jnp
@@ -39,8 +39,8 @@ def jax_mel_spectrogram(
         sample_rate=sample_rate, n_fft=n_fft, n_mels=n_mels
     )
     
-    cpu_device = jax.devices('cpu')[0]
-    mel_filterbank = jax.device_put(mel_filterbank, cpu_device)
+    # cpu_device = jax.devices('cpu')[0]
+    # mel_filterbank = jax.device_put(mel_filterbank, cpu_device)
 
     def process_single_waveform(waveform):
         _, _, stft_matrix = stft(
@@ -66,48 +66,52 @@ def jax_mel_spectrogram(
 
     batched_mel_spectrogram_fn = jax.vmap(process_single_waveform)
     
-    waveforms = jax.device_put(waveforms, cpu_device)
+    # waveforms = jax.device_put(waveforms, cpu_device)
 
     return batched_mel_spectrogram_fn(waveforms)
 
 
 class AudioDataSource(RandomAccessDataSource):
-    def __init__(self, root_path, tokenizer):
-        self._reader = csv.DictReader(open(osp.join(root_path, 'train.tsv')), delimiter='\t')
-        self._data = [(osp.join(root_path, 'clips_16k', entry['path'].replace('mp3', 'flac')),
-                        entry['sentence']) for entry in self._reader]
+    def __init__(self, df, tokenizer):
+        self.data_df = df[df['duration'] <= 11]
+
+        self.max_duration = self.data_df['duration'].max()
+        self.max_tokens = self.data_df['label_token_count'].max()
+        self.max_frames = int(self.max_duration * 16_000)
+
+        # self.cpu_device = jax.devices('cpu')[0]
         self.tokenizer = tokenizer
     
     def __getitem__(self, idx):
-        sig, sr = librosa.load(self._data[idx][0], sr=None)
-        tokens = np.asarray(self.tokenizer.encode(self._data[idx][1]), dtype=np.int32)
+        sig, sr = librosa.load(self.data_df.iloc[idx]['path'], sr=None)
+        tokens = jnp.asarray(self.tokenizer.encode(self.data_df.iloc[idx]['sentence']), dtype=jnp.int32)
+        sig = jnp.asarray(sig, dtype=jnp.float32)
+        sig_padded = jnp.pad(sig, (0, self.max_frames - sig.shape[0]), mode='constant', constant_values=0)
+        tokens_padded = jnp.pad(tokens, (0, self.max_tokens - len(tokens)), mode='constant', constant_values=0)
 
-        return {'audio': sig, 'label': tokens}
+        return {'audio': sig_padded, 'label': tokens_padded}
 
     def __len__(self):
-        return len(self._data)
+        return self.data_df.shape[0]
     
 
-def batch_fn(batch, audio_config, tokenizer):
-    audios = [item['audio'] for item in batch]
-    labels = [item['label'] for item in batch]
+def batch_fn(batch):
+    data = {'audios': [], 'labels': [], 'input_lengths': [], 'label_lengths': []}
 
-    input_lengths = [len(x) for x in audios]
-    label_lengths = [len(x) for x in labels]
+    for item in batch:
+        data['audios'].append(item['audio'])
+        data['labels'].append(item['label'])
+        data['input_lengths'].append(len(item['audio']))
+        data['label_lengths'].append(len(item['label']))
 
-    padded_audios = np.zeros((len(batch), max(input_lengths)), dtype=np.float32)
-    padded_labels = np.full((len(batch), max(label_lengths)), tokenizer.blank_id, dtype=np.int32)
-
-    for i, (audio, label) in enumerate(zip(audios, labels)):
-        padded_audios[i, :len(audio)] = audio
-        padded_labels[i, :len(label)] = label
-
+    padded_audios = jnp.asarray(data['audios'], dtype=jnp.float32)
+    padded_labels = jnp.asarray(data['labels'], dtype=jnp.float32)
 
     mel_spectrogram = jax_mel_spectrogram(padded_audios)
 
     return {
         "inputs": jnp.asarray(mel_spectrogram, dtype=jnp.float16),  # (B, T, F)
-        "input_lengths": jnp.asarray(input_lengths),
-        "labels": jnp.asarray(padded_labels),
-        "label_lengths": jnp.asarray(label_lengths),
+        "input_lengths": jnp.asarray(data['input_lengths'], dtype=jnp.int32),
+        "labels": jnp.asarray(padded_labels, dtype=jnp.int32),
+        "label_lengths": jnp.asarray(data['label_lengths'], dtype=jnp.int32),
     }
