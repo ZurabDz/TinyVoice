@@ -13,11 +13,11 @@ class ConformerBlock(nnx.Module):
     """ A single block of the Conformer encoder. """
     def __init__(self, config: ConformerConfig, *, rngs: nnx.Rngs):
         self.ffn1 = FeedForwardModule(config.encoder_dim, config.feed_forward_expansion_factor, config.feed_forward_dropout_p, rngs=rngs)
-        self.self_attn = nnx.MultiHeadAttention(config.num_attention_heads, config.encoder_dim, 32, rngs=rngs)
+        self.self_attn = nnx.MultiHeadAttention(config.num_attention_heads, config.encoder_dim, 32, dtype=jnp.float16, rngs=rngs)
         self.conv_module = ConvolutionModule(config.encoder_dim, config.conv_kernel_size, config.conv_expansion_factor, config.conv_dropout_p, rngs=rngs)
         self.ffn2 = FeedForwardModule(config.encoder_dim, config.feed_forward_expansion_factor, config.feed_forward_dropout_p, rngs=rngs)
-        self.layer_norm = nnx.LayerNorm(config.encoder_dim, rngs=rngs)
-        self.dropout = nnx.Dropout(config.feed_forward_dropout_p)
+        self.layer_norm = nnx.LayerNorm(config.encoder_dim, dtype=jnp.float32, rngs=rngs)
+        self.dropout = nnx.Dropout(config.feed_forward_dropout_p, rngs=rngs)
         
     def __call__(self, x: jnp.ndarray, pad_mask: jnp.ndarray, *, training: bool) -> jnp.ndarray:
         x = x + 0.5 * self.ffn1(x, training=training)
@@ -32,7 +32,7 @@ class ConformerEncoder(nnx.Module):
     def __init__(self, config: ConformerConfig, num_classes: int, *, rngs: nnx.Rngs):
         self.conv_subsampling = ConvolutionSubsampling(config.encoder_dim, rngs=rngs)
         self.encoder_blocks = [ConformerBlock(config, rngs=rngs) for _ in range(config.num_encoder_layers)]
-        self.output_linear = nnx.Linear(config.encoder_dim, num_classes, rngs=rngs)
+        self.output_linear = nnx.Linear(config.encoder_dim, num_classes, dtype=jnp.float16, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, input_lengths: jnp.ndarray, *, training: bool) -> Tuple[jnp.ndarray, jnp.ndarray]:
         x = self.conv_subsampling(x, training=training)
