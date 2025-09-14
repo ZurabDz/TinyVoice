@@ -1,117 +1,83 @@
-import pandas as pd
-from pathlib import Path
-import librosa
+from array_record.python import array_record_module
+from tqdm import tqdm
+import pickle
+import struct
 import numpy as np
-import jax.numpy as jnp
-import jax
-from grain.sources import RandomAccessDataSource
-from jax.scipy.signal import stft
-from flax import nnx
+import grain
+import librosa
+from pathlib import Path
+from io import BytesIO
 
 
-def create_mel_filterbank(
-    sample_rate=16000,
-    n_fft=400,
-    n_mels=80,
-    fmin=0.0,
-    fmax=None,
-    dtype=jnp.float32,
-):
-    fmax = fmax if fmax is not None else sample_rate / 2.0
-    mel_fb = librosa.filters.mel(
-        sr=sample_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax
+def pack_speech_data(audio_bytes, metadata):
+    serialized_metadata = pickle.dumps(metadata)
+    metadata_len = len(serialized_metadata)
+    packed_metadata_len = struct.pack('I', metadata_len)
+    combined_data = packed_metadata_len + serialized_metadata + audio_bytes
+
+    return combined_data
+
+
+def unpack_speech_data(combined_data):
+    metadata_len = struct.unpack('I', combined_data[:4])[0]
+    metadata_offset = 4 + metadata_len
+    serialized_metadata = combined_data[4:metadata_offset]
+
+    parsed_metadata = pickle.loads(serialized_metadata)
+    parsed_file_data = combined_data[metadata_offset:]
+
+    return parsed_metadata, parsed_file_data
+
+def create_array_record_dataset(df, root_path):
+    example_file_path = Path(str(root_path)) / 'data.array_record'
+    writer = array_record_module.ArrayRecordWriter(
+        str(example_file_path), "group_size:1"
     )
-    return jnp.array(mel_fb, dtype=dtype)
+
+    record_count = 0
+    for row in tqdm(df.itertuples(), total=df.shape[0]):
+        with open(row.path, 'rb') as f:
+            data = f.read()
+
+        metadata = {'label': row.sentence, 'duration': row.duration}
+        writer.write(pack_speech_data(data, metadata))
+        record_count += 1
+
+    writer.close()
+
+def batch_fn(batch, tokenizer):
+    audios = [item['audio'] for item in batch]
+    labels = [item['label'] for item in batch]
+
+    input_lengths = [len(x) for x in audios]
+    label_lengths = [len(x) for x in labels]
+
+    padded_audios = np.zeros((len(batch), 205632), dtype=np.float32)
+    padded_labels = np.full((len(batch), 164), tokenizer.blank_id, dtype=np.int32)
+
+    for i, (audio, label) in enumerate(zip(audios, labels)):
+        padded_audios[i, :len(audio)] = audio
+        padded_labels[i, :len(label)] = label
 
 
-@nnx.jit
-def jax_mel_spectrogram(
-    waveforms,  # Expecting a batch of waveforms
-    sample_rate=16000,
-    n_fft=400,
-    win_length=400,
-    hop_length=160,
-    n_mels=80,
-    power=2.0,
-    log_epsilon=1e-10,
-):
-    mel_filterbank = create_mel_filterbank(
-        sample_rate=sample_rate, n_fft=n_fft, n_mels=n_mels
-    )
-    
-    # cpu_device = jax.devices('cpu')[0]
-    # mel_filterbank = jax.device_put(mel_filterbank, cpu_device)
-
-    def process_single_waveform(waveform):
-        _, _, stft_matrix = stft(
-            waveform,
-            fs=sample_rate,
-            nperseg=win_length,
-            noverlap=win_length - hop_length,
-            nfft=n_fft,
-            window='hann',
-            boundary='constant',
-            padded=False,
-        )
-        stft_matrix = jnp.transpose(stft_matrix)
-
-        power_spectrogram = jnp.abs(stft_matrix) ** power
-
-        # (Time, Freqs) @ (Freqs, Mels) -> (Time, Mels)
-        mel_spectrogram = jnp.dot(power_spectrogram, mel_filterbank.T)
-
-        log_mel_spectrogram = jnp.log(mel_spectrogram + log_epsilon)
-
-        return log_mel_spectrogram
-
-    batched_mel_spectrogram_fn = jax.vmap(process_single_waveform)
-    
-    # waveforms = jax.device_put(waveforms, cpu_device)
-
-    return batched_mel_spectrogram_fn(waveforms)
-
-
-class AudioDataSource(RandomAccessDataSource):
-    def __init__(self, df, tokenizer):
-        self.data_df = df[df['duration'] <= 11]
-
-        self.max_duration = self.data_df['duration'].max()
-        self.max_tokens = self.data_df['label_token_count'].max()
-        self.max_frames = int(self.max_duration * 16_000)
-
-        # self.cpu_device = jax.devices('cpu')[0]
-        self.tokenizer = tokenizer
-    
-    def __getitem__(self, idx):
-        sig, sr = librosa.load(self.data_df.iloc[idx]['path'], sr=None)
-        tokens = jnp.asarray(self.tokenizer.encode(self.data_df.iloc[idx]['sentence']), dtype=jnp.int32)
-        sig = jnp.asarray(sig, dtype=jnp.float32)
-        sig_padded = jnp.pad(sig, (0, self.max_frames - sig.shape[0]), mode='constant', constant_values=0)
-        tokens_padded = jnp.pad(tokens, (0, self.max_tokens - len(tokens)), mode='constant', constant_values=0)
-
-        return {'audio': sig_padded, 'label': tokens_padded}
-
-    def __len__(self):
-        return self.data_df.shape[0]
-    
-
-def batch_fn(batch):
-    data = {'audios': [], 'labels': [], 'input_lengths': [], 'label_lengths': []}
-
-    for item in batch:
-        data['audios'].append(item['audio'])
-        data['labels'].append(item['label'])
-        data['input_lengths'].append(len(item['audio']))
-        data['label_lengths'].append(len(item['label']))
-
-    padded_audios = jnp.asarray(data['audios'], dtype=jnp.float32)
-    padded_labels = jnp.asarray(data['labels'], dtype=jnp.float32)
-
-    mel_spectrogram = jax_mel_spectrogram(padded_audios)
-
-    return {
-        "inputs": jnp.asarray(mel_spectrogram, dtype=jnp.float16),  # (B, T, F)
-        "input_lengths": jnp.asarray(data['input_lengths'], dtype=jnp.int32),
-        "labels": jnp.asarray(padded_labels, dtype=jnp.int32),
-        "label_lengths": jnp.asarray(data['label_lengths'], dtype=jnp.int32),
+    result = {
+        'inputs': padded_audios,
+        'input_lengths': np.asarray(input_lengths),
+        'labels': np.asarray(padded_labels),
+        'label_lengths': np.asarray(label_lengths)
     }
+
+    return result
+
+
+class ProcessAudioData(grain.transforms.Map):
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def map(self, element: bytes):
+        metadata, audio_bytes = unpack_speech_data(element)
+        data = BytesIO(audio_bytes)
+        sig, sr = librosa.load(data, sr=None)
+        metadata['audio'] = sig
+        metadata['label'] = self.tokenizer.encode(metadata['label'])
+        return metadata

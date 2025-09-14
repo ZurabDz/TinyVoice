@@ -1,4 +1,3 @@
-import csv
 import os.path as osp
 
 class Tokenizer:

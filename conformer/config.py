@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-
+import jax.numpy as jnp
 
 @dataclass
 class TrainingConfig:
@@ -28,9 +28,9 @@ class SpecAugmentConfig:
     
 @dataclass
 class ConformerConfig:
-    input_dim: int = 80
-    num_encoder_layers: int = 8
-    encoder_dim: int = 144
+    input_dim: int = 128
+    num_encoder_layers: int = 6
+    encoder_dim: int = 256
     num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 4
     conv_expansion_factor: int = 2
@@ -39,3 +39,4 @@ class ConformerConfig:
     conv_dropout_p: float = 0.1
     conv_kernel_size: int = 31
     subsampling_factor: int = 4
+    dtype: jnp.dtype = jnp.bfloat16
