@@ -15,7 +15,7 @@ class ConformerBlock(nnx.Module):
     def __init__(self, config: ConformerConfig, *, rngs: nnx.Rngs):
         self.ffn1 = FeedForwardModule(config.encoder_dim, config.feed_forward_expansion_factor,
                                         config.feed_forward_dropout_p, dtype=config.dtype, rngs=rngs)
-        self.self_attn = nnx.MultiHeadAttention(config.num_attention_heads, config.encoder_dim, 32,
+        self.self_attn = nnx.MultiHeadAttention(config.num_attention_heads, config.encoder_dim, 64,
                                                  dtype=jnp.float16, rngs=rngs)
         self.conv_module = ConvolutionModule(config.encoder_dim, config.conv_kernel_size, 
         config.conv_expansion_factor, config.conv_dropout_p, dtype=config.dtype, rngs=rngs)
@@ -43,7 +43,7 @@ class ConformerEncoder(nnx.Module):
 
     def __call__(self, x: jnp.ndarray, input_lengths: jnp.ndarray, *, training) -> Tuple[jnp.ndarray, jnp.ndarray]:
         x = self.mel_feature(x)
-        x = self.conv_subsampling(x)
+        x = self.conv_subsampling(x, training=training)
         
         output_lengths = input_lengths // 4
         
