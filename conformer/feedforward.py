@@ -4,7 +4,6 @@ import jax.numpy as jnp
 
 
 class FeedForwardModule(nnx.Module):
-    """ Feed-forward module as described in the Conformer paper. """
     def __init__(self, in_dim: int, expansion_factor: int, dropout_p: float, *, dtype, rngs: nnx.Rngs):
         expanded_dim = in_dim * expansion_factor
         self.layer_norm = nnx.LayerNorm(in_dim, rngs=rngs, dtype=jnp.bfloat16)
