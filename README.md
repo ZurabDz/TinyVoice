@@ -11,6 +11,21 @@
     - [x] padding each audios to some magic MAX_LENGTH
     - [x] padding each labels to some magic MAX_LENGTH
     - [ ] explore option to precompile on multiple shapes? at least will have multiple magic MAX_LENGTHES?
+        - [ ] explore [EasyDel](https://github.com/erfanzar/EasyDeL) multi compile step options
 - [ ] actually running a training
-    - [ ] simply try it out on ASR first
-    - [ ] if first attempts do not yeld a result switch towards simpler ASR dataset at first
+    - [x] simply try it out on ASR first
+
+
+#### First run on google colab tpu v5e-1 looked pretty good, some bugs need to be ironed out
+
+- [ ] Training Fixes
+    - [ ] mixed precision is weird, som norm are fp32 some bf16
+    - [ ] detokenizer is weird taking list[str] instead of list[int]
+    - [ ] tpu req attention fp32 and doesn't work on bf16? what? probably my mystake cause on rtx 2070 Super it does work
+    - [ ] 80% tpu util 5GB "VRAM" usage with 64 batch. What? will look into it. rtx 2070 took 8Gb with 24 batch
+    - [ ] config tweaking, model size, batch size, training args
+    - [ ] fully working multiple epochs training
+    - [ ] model saving and loading + training data saving and loading
+    - [ ] check steps and lr schedule do indeed work with optimizer 
+    - [ ] need valid and test sets with jitted steps
+    - [ ] instead of train.tsv we should combined validated + other tsvs
