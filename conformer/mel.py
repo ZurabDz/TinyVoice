@@ -38,8 +38,9 @@ class MelSpectrogram(nnx.Module):
             n_mels=self.n_mels,
             fmin=self.fmin,
             fmax=self.fmax,
+            dtype=self.dtype
         )
-        self.mel_filterbank = nnx.Param(jnp.array(mel_fb, dtype=self.dtype))
+        self.mel_filterbank = jnp.array(mel_fb, dtype=self.dtype)
 
     def __call__(self, waveforms: jnp.ndarray) -> jnp.ndarray:
         def process_single_waveform(waveform):
@@ -58,7 +59,7 @@ class MelSpectrogram(nnx.Module):
             power_spectrogram = jnp.abs(stft_matrix) ** self.power
 
             # (Time, Freqs) @ (Freqs, Mels) -> (Time, Mels)
-            mel_spectrogram = jnp.dot(power_spectrogram, self.mel_filterbank.value.T)
+            mel_spectrogram = jnp.dot(power_spectrogram, self.mel_filterbank.T)
 
             log_mel_spectrogram = jnp.log(mel_spectrogram + self.log_epsilon)
 
