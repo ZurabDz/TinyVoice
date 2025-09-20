@@ -28,8 +28,8 @@ def unpack_speech_data(combined_data):
 
     return parsed_metadata, parsed_file_data
 
-def create_array_record_dataset(df, root_path):
-    example_file_path = Path(str(root_path)) / 'data.array_record'
+def create_array_record_dataset(df, root_path: Path):
+    example_file_path = root_path / 'data.array_record'
     writer = array_record_module.ArrayRecordWriter(
         str(example_file_path), "group_size:1"
     )
@@ -39,7 +39,7 @@ def create_array_record_dataset(df, root_path):
         with open(row.path, 'rb') as f:
             data = f.read()
 
-        metadata = {'label': row.sentence, 'duration': row.duration}
+        metadata = {'label': row.label, 'frames': row.frames}
         writer.write(pack_speech_data(data, metadata))
         record_count += 1
 
@@ -52,7 +52,8 @@ def batch_fn(batch, tokenizer):
     input_lengths = [len(x) for x in audios]
     label_lengths = [len(x) for x in labels]
 
-    padded_audios = np.zeros((len(batch), 205632), dtype=np.float32)
+    # FIXME: fix magic numbers
+    padded_audios = np.zeros((len(batch), 235008), dtype=np.float32)
     padded_labels = np.full((len(batch), 164), tokenizer.blank_id, dtype=np.int32)
 
     for i, (audio, label) in enumerate(zip(audios, labels)):
