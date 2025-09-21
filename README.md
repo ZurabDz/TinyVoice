@@ -20,27 +20,11 @@
 
 - [ ] Training Fixes
     - [ ] mixed precision is weird, som norm are fp32 some bf16
-    - [ ] detokenizer is weird taking list[str] instead of list[int]
+    - [x] detokenizer is weird taking list[str] instead of list[int]
     - [ ] tpu req attention fp32 and doesn't work on bf16? what? probably my mystake cause on rtx 2070 Super it does work
-    - [ ] 80% tpu util 5GB "VRAM" usage with 64 batch. What? will look into it. rtx 2070 took 8Gb with 24 batch
     - [ ] config tweaking, model size, batch size, training args
-    - [ ] fully working multiple epochs training
+    - [x] fully working multiple epochs training
     - [ ] model saving and loading + training data saving and loading
     - [ ] check steps and lr schedule do indeed work with optimizer 
-    - [ ] need valid and test sets with jitted steps
-    - [ ] instead of train.tsv we should combined validated + other tsvs
-
-
-##### Generic steps
-
-I should have like steps:
-
-* script processing common voice
-    * resample audios to 16khz
-    * create new train/test split .csv files and add resampled full path + audio durations
-
-* training* tokenizer 
-    * loads train data and builds tokenizer. 
-    * save tokenizer to given path
-
-* training ipynb
+    - [x] need valid and test sets with jitted steps
+    - [x] instead of train.tsv we should combined validated + other tsvs
