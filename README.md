@@ -29,3 +29,18 @@
     - [ ] check steps and lr schedule do indeed work with optimizer 
     - [ ] need valid and test sets with jitted steps
     - [ ] instead of train.tsv we should combined validated + other tsvs
+
+
+##### Generic steps
+
+I should have like steps:
+
+* script processing common voice
+    * resample audios to 16khz
+    * create new train/test split .csv files and add resampled full path + audio durations
+
+* training* tokenizer 
+    * loads train data and builds tokenizer. 
+    * save tokenizer to given path
+
+* training ipynb
