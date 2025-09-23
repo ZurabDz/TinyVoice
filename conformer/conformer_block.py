@@ -16,7 +16,7 @@ class ConformerBlock(nnx.Module):
         self.ffn1 = FeedForwardModule(config.encoder_dim, config.feed_forward_expansion_factor,
                                         config.feed_forward_dropout_p, dtype=config.dtype, rngs=rngs)
         self.self_attn = nnx.MultiHeadAttention(config.num_attention_heads, config.encoder_dim, 64,
-                                                 dtype=jnp.float16, rngs=rngs)
+                                                 dtype=jnp.float32, rngs=rngs)
         self.conv_module = ConvolutionModule(config.encoder_dim, config.conv_kernel_size, 
         config.conv_expansion_factor, config.conv_dropout_p, dtype=config.dtype, rngs=rngs)
         self.ffn2 = FeedForwardModule(config.encoder_dim, config.feed_forward_expansion_factor,
