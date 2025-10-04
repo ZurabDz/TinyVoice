@@ -61,7 +61,8 @@ loss = train_step(model, optimizer, processed_train_dataset[0])
 
 
 from clu import metric_writers
-from tqdm import tqdm
+from tqdm.notebook import tqdm
+
 
 logdir = './metrics'
 
@@ -70,11 +71,11 @@ total_loss_accumulator = 0
 
 
 n_steps_to_save_avg_train_loss = 10
-n_steps_for_eval = 500
+n_steps_for_eval = 1000
 
 
 for step_count, batch in tqdm(enumerate(processed_train_dataset, 1),
-                            total=len(processed_train_dataset)):
+                            total=len(processed_train_dataset), desc="training loop", colour="green"):
     
     loss = train_step(model, optimizer, batch)
     total_loss_accumulator += loss.item()
