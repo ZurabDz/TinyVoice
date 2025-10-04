@@ -1,4 +1,3 @@
-
 from tqdm.notebook import tqdm
 from conformer.tokenizer import Tokenizer
 from conformer.dataset import batch_fn, ProcessAudioData, unpack_speech_data
@@ -11,7 +10,6 @@ import jax.numpy as jnp
 import optax
 import jax
 
-# conformer_config = ConformerConfig(num_encoder_layers=18)
 conformer_config = ConformerConfig()
 train_config = TrainingConfig()
 
@@ -30,6 +28,7 @@ processed_train_dataset = (
     .shuffle(seed=42)
     .map(ProcessAudioData(tokenizer))
     .batch(batch_size=48, batch_fn=tokenizer_batch_fn)
+    .repeat(5)
 )
 
 processed_test_dataset = (
@@ -62,6 +61,8 @@ loss = train_step(model, optimizer, processed_train_dataset[0])
 
 
 from clu import metric_writers
+from tqdm import tqdm
+
 logdir = './metrics'
 
 writer = metric_writers.create_default_writer(logdir)
@@ -71,27 +72,23 @@ total_loss_accumulator = 0
 n_steps_to_save_avg_train_loss = 10
 n_steps_for_eval = 500
 
-from tqdm import tqdm
 
+for step_count, batch in tqdm(enumerate(processed_train_dataset, 1),
+                            total=len(processed_train_dataset)):
+    
+    loss = train_step(model, optimizer, batch)
+    total_loss_accumulator += loss.item()
 
-for epoch in range(3):
-    print("EPOCH: ", epoch + 1)
-    for step_count, batch in tqdm(enumerate(processed_train_dataset, 1),
-                                total=len(processed_train_dataset)):
-        
-        loss = train_step(model, optimizer, batch)
-        total_loss_accumulator += loss.item()
+    if step_count % n_steps_to_save_avg_train_loss == 0:
+        avg_loss = total_loss_accumulator / n_steps_to_save_avg_train_loss
+        writer.write_scalars(step_count, {'train_loss': avg_loss})
+        total_loss_accumulator = 0
 
-        if step_count % n_steps_to_save_avg_train_loss == 0:
-            avg_loss = total_loss_accumulator / n_steps_to_save_avg_train_loss
-            writer.write_scalars(step_count, {'train_loss': avg_loss})
-            total_loss_accumulator = 0
+    if step_count % n_steps_for_eval == 0:
+        total_eval_loss_accumulator = 0
+        for eval_batch in tqdm(processed_test_dataset, desc='eval loop', colour='blue', leave=False):
+            eval_loss = eval_step(model, batch)
+            total_eval_loss_accumulator += eval_loss
 
-        if step_count % n_steps_for_eval == 0:
-            total_eval_loss_accumulator = 0
-            for eval_batch in tqdm(processed_test_dataset, desc='eval loop', colour='blue', leave=False):
-                eval_loss = eval_step(model, batch)
-                total_eval_loss_accumulator += eval_loss
-
-            avg_eval_loss = total_eval_loss_accumulator / len(processed_test_dataset)
-            writer.write_scalars(step_count, {'eval_loss': avg_eval_loss})
+        avg_eval_loss = total_eval_loss_accumulator / len(processed_test_dataset)
+        writer.write_scalars(step_count, {'eval_loss': avg_eval_loss})
