@@ -37,7 +37,7 @@ class ConformerEncoder(nnx.Module):
     def __init__(self, config: ConformerConfig, num_classes: int, *, rngs: nnx.Rngs):
         self.mel_feature = MelSpectrogram(n_mels=config.input_dim)
         self.conv_subsampling = ConvolutionSubsampling(config, rngs=rngs)
-        self.encoder_blocks = [ConformerBlock(config, rngs=rngs) for _ in range(config.num_encoder_layers)]
+        self.encoder_blocks = nnx.List([ConformerBlock(config, rngs=rngs) for _ in range(config.num_encoder_layers)])
         self.output_linear = nnx.Linear(config.encoder_dim, num_classes, dtype=config.dtype, rngs=rngs)
 
 
