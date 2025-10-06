@@ -15,7 +15,7 @@ class ConformerBlock(nnx.Module):
     def __init__(self, config: ConformerConfig, *, rngs: nnx.Rngs):
         self.ffn1 = FeedForwardModule(config.encoder_dim, config.feed_forward_expansion_factor,
                                         config.feed_forward_dropout_p, dtype=config.dtype, rngs=rngs)
-        self.self_attn = nnx.MultiHeadAttention(config.num_attention_heads, config.encoder_dim, 512,
+        self.self_attn = nnx.MultiHeadAttention(config.num_attention_heads, config.encoder_dim, 128,
                                                  dtype=config.dtype, dropout_rate=0.1, rngs=rngs)
         self.conv_module = ConvolutionModule(config.encoder_dim, config.conv_kernel_size, 
         config.conv_expansion_factor, config.conv_dropout_p, dtype=config.dtype, rngs=rngs)
@@ -37,7 +37,7 @@ class ConformerEncoder(nnx.Module):
     def __init__(self, config: ConformerConfig, num_classes: int, *, rngs: nnx.Rngs):
         self.mel_feature = MelSpectrogram(n_mels=config.input_dim)
         self.conv_subsampling = ConvolutionSubsampling(config, rngs=rngs)
-        self.encoder_blocks = nnx.List([ConformerBlock(config, rngs=rngs) for _ in range(config.num_encoder_layers)])
+        self.encoder_blocks = [ConformerBlock(config, rngs=rngs) for _ in range(config.num_encoder_layers)]
         self.output_linear = nnx.Linear(config.encoder_dim, num_classes, dtype=config.dtype, rngs=rngs)
 
 
