@@ -84,7 +84,7 @@ class ConformerEncoder(nnx.Module):
             rngs=rngs,
             dither=feat_cfg.dither,
         )
-        self.pos_encoder = PositionalEncoding(128, 0.1, 2000, rngs=rngs)
+        self.pos_encoder = PositionalEncoding(config.encoder_dim, 0.1, 2000, rngs=rngs)
         self.conv_subsampling = ConvolutionSubsampling(config, rngs=rngs)
         self.encoder_blocks = nnx.List(
             [
