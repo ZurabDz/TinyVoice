@@ -4,6 +4,8 @@ import jax.numpy as jnp
 from jax.scipy.signal import stft
 from flax import nnx
 from typing import Optional
+import jax
+
 
 class MelSpectrogram(nnx.Module):
     def __init__(
@@ -12,12 +14,14 @@ class MelSpectrogram(nnx.Module):
         n_fft: int = 400,
         win_length: int = 400,
         hop_length: int = 160,
-        n_mels: int = 128,
+        n_mels: int = 80,
         power: float = 2.0,
         fmin: float = 0.0,
         fmax: Optional[float] = None,
         log_epsilon: float = 1e-10,
         dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs = None,
+        dither: float = None,
     ):
 
         self.sample_rate = sample_rate
@@ -30,6 +34,8 @@ class MelSpectrogram(nnx.Module):
         self.fmax = fmax if fmax is not None else sample_rate / 2.0
         self.log_epsilon = log_epsilon
         self.dtype = dtype
+        self.rngs = rngs
+        self.dither = dither
 
         # Create and store the mel filterbank as a static parameter
         mel_fb = librosa.filters.mel(
@@ -38,11 +44,17 @@ class MelSpectrogram(nnx.Module):
             n_mels=self.n_mels,
             fmin=self.fmin,
             fmax=self.fmax,
-            dtype=self.dtype
+            dtype=self.dtype,
         )
         self.mel_filterbank = jnp.array(mel_fb, dtype=self.dtype)
 
-    def __call__(self, waveforms: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, waveforms: jnp.ndarray, training) -> jnp.ndarray:
+        if training and self.dither > 0:
+            rand_waves = jax.random.normal(
+                self.rngs.fork().default.key.value, shape=waveforms.shape
+            )
+            waveforms += rand_waves * 0.00001
+
         def process_single_waveform(waveform):
             _, _, stft_matrix = stft(
                 waveform,
