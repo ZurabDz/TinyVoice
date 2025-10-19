@@ -36,13 +36,22 @@ def loss_fn(model: ConformerEncoder, batch, training):
     return loss
 
 
-@nnx.jit(donate_argnums=0)
-def train_step(model: ConformerEncoder, optimizer: nnx.Optimizer, batch: dict):
+# @nnx.jit(donate_argnums=0)
+# @nnx.jit
+# def train_step(model: ConformerEncoder, optimizer: nnx.Optimizer, batch: dict):
+#     loss, grads = nnx.value_and_grad(loss_fn)(model, batch, training=True)
+#     optimizer.update(model=model, grads=grads)
+#     return loss
+
+@nnx.jit
+def train_step(graphdef, state, batch):
+    model, optimizer = nnx.merge(graphdef, state)
     loss, grads = nnx.value_and_grad(loss_fn)(model, batch, training=True)
     optimizer.update(model=model, grads=grads)
-    return loss, grads
+    state = nnx.state((model, optimizer))
+    return loss, state
 
-
-@nnx.jit(donate_argnums=0)
-def eval_step(model: ConformerEncoder, batch: dict):
+@nnx.jit
+def eval_step(graphdef, state, batch):
+    model, _ = nnx.merge(graphdef, state)
     return loss_fn(model, batch, training=False)

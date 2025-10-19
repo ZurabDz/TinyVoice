@@ -50,10 +50,11 @@ class MelSpectrogram(nnx.Module):
 
     def __call__(self, waveforms: jnp.ndarray, training) -> jnp.ndarray:
         if training and self.dither > 0:
+            key = self.rngs.fork().default.key.value
             rand_waves = jax.random.normal(
-                self.rngs.fork().default.key.value, shape=waveforms.shape
+                key, shape=waveforms.shape
             )
-            waveforms += rand_waves * 0.00001
+            waveforms = waveforms + rand_waves * self.dither
 
         def process_single_waveform(waveform):
             _, _, stft_matrix = stft(

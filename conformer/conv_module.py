@@ -16,7 +16,7 @@ class ConvolutionModule(nnx.Module):
         dtype,
         rngs: nnx.Rngs,
     ):
-        self.layer_norm = nnx.LayerNorm(in_dim, dtype=jnp.bfloat16, rngs=rngs)
+        self.layer_norm = nnx.LayerNorm(in_dim, dtype=dtype, rngs=rngs)
         self.pointwise_conv1 = nnx.Conv(
             in_dim, in_dim * expansion_factor, kernel_size=(1,), dtype=dtype, rngs=rngs
         )
@@ -30,7 +30,7 @@ class ConvolutionModule(nnx.Module):
             rngs=rngs,
         )
         self.batch_norm = nnx.BatchNorm(
-            in_dim, dtype=jnp.bfloat16, momentum=0.9, epsilon=1e-5, rngs=rngs
+            in_dim, dtype=dtype, momentum=0.9, epsilon=1e-5, rngs=rngs
         )
         self.swish = Swish()
         self.pointwise_conv2 = nnx.Conv(
@@ -47,4 +47,4 @@ class ConvolutionModule(nnx.Module):
         x_swish = self.swish(x_bn)
         x_pointwise = self.pointwise_conv2(x_swish)
         x_drop = self.dropout(x_pointwise, deterministic=not training)
-        return x + x_drop
+        return x_drop

@@ -27,7 +27,7 @@ class ConformerBlock(nnx.Module):
             config.encoder_dim,
             config.encoder_dim // config.num_attention_heads,
             dtype=config.dtype,
-            dropout_rate=0.1,
+            dropout_rate=config.attention_dropout_p,
             rngs=rngs,
         )
         self.conv_module = ConvolutionModule(
@@ -48,7 +48,7 @@ class ConformerBlock(nnx.Module):
         self.layer_norm = nnx.LayerNorm(
             config.encoder_dim, dtype=config.dtype, rngs=rngs
         )
-        self.dropout = nnx.Dropout(config.feed_forward_dropout_p, rngs=rngs)
+        self.dropout = nnx.Dropout(config.attention_dropout_p, rngs=rngs)
 
     def __call__(
         self, x: jnp.ndarray, pad_mask: jnp.ndarray, *, training
@@ -101,12 +101,14 @@ class ConformerEncoder(nnx.Module):
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         x = self.mel_feature(x, training)
         x = self.conv_subsampling(x, training=training)
-        x, _ = self.pos_encoder(x)
+        x, _ = self.pos_encoder(x, training=training)
 
-        output_lengths = input_lengths // 4
+        # output_lengths = input_lengths // 160
+        output_lengths = input_lengths
+        output_lengths = output_lengths // 4
 
         max_len = x.shape[1]
-        pad_mask = jnp.arange(max_len)[None, :] >= output_lengths[:, None]
+        pad_mask = jnp.arange(max_len)[None, :] < output_lengths[:, None]
         pad_mask = jnp.expand_dims(pad_mask, axis=1)
         pad_mask = jnp.expand_dims(pad_mask, axis=1)
 
@@ -114,6 +116,6 @@ class ConformerEncoder(nnx.Module):
             x = block(x, pad_mask, training=training)
 
         logits = self.output_linear(x)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        # log_probs = jax.nn.log_softmax(logits, axis=-1)
 
-        return log_probs, output_lengths
+        return logits, output_lengths

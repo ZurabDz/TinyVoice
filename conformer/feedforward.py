@@ -14,7 +14,7 @@ class FeedForwardModule(nnx.Module):
         rngs: nnx.Rngs,
     ):
         expanded_dim = in_dim * expansion_factor
-        self.layer_norm = nnx.LayerNorm(in_dim, rngs=rngs, dtype=jnp.bfloat16)
+        self.layer_norm = nnx.LayerNorm(in_dim, rngs=rngs, dtype=dtype)
         self.linear1 = nnx.Linear(in_dim, expanded_dim, dtype=dtype, rngs=rngs)
         self.swish = Swish()
         self.dropout1 = nnx.Dropout(dropout_p, rngs=rngs)

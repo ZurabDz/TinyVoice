@@ -50,7 +50,7 @@ class PositionalEncoding(nnx.Module):
         positions = jnp.arange(0, length, dtype=jnp.float32)[:, None]
         self.pe.value = self.create_pe(positions=positions, dtype=dtype)
 
-    def __call__(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, x: jnp.ndarray, training: bool) -> tuple[jnp.ndarray, jnp.ndarray]:
         input_len = x.shape[1]
 
         # self.extend_pe(input_len, x.dtype)
@@ -58,7 +58,7 @@ class PositionalEncoding(nnx.Module):
         pos_emb = self.pe.value[:, :input_len]
 
         if self.dropout_emb is not None:
-            pos_emb = self.dropout_emb(pos_emb)
+            pos_emb = self.dropout_emb(pos_emb, deterministic=not training)
 
         x = x + pos_emb
-        return self.dropout(x), pos_emb
+        return self.dropout(x, deterministic=not training), pos_emb
