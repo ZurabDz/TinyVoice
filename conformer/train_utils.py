@@ -11,11 +11,14 @@ def create_padding_mask(lengths: jnp.ndarray, max_len: int) -> jnp.ndarray:
     return mask.astype(jnp.float32)
 
 
-def create_learning_rate_fn(warmup_steps: int, model_size: int):
+def create_learning_rate_fn(warmup_steps: int, base_lr: float):
     def lr_fn(step):
-        arg1 = 1 / jnp.sqrt(step + 1e-9)
-        arg2 = step * (warmup_steps**-1.5)
-        return (1 / jnp.sqrt(model_size)) * jnp.minimum(arg1, arg2)
+        # No warmup if warmup_steps is 0 - use constant learning rate
+        if warmup_steps == 0:
+            return base_lr
+        # Otherwise, linear warmup then constant
+        warmup_factor = jnp.minimum(step / warmup_steps, 1.0)
+        return base_lr * warmup_factor
 
     return lr_fn
 
@@ -31,7 +34,7 @@ def loss_fn(model: ConformerEncoder, batch, training):
     label_paddings = create_padding_mask(batch["label_lengths"], max_label_len)
 
     loss = optax.ctc_loss(
-        log_probs, logit_paddings, batch["labels"], label_paddings
+        log_probs, logit_paddings, batch["labels"], label_paddings, blank_id=0
     ).mean()
     return loss
 

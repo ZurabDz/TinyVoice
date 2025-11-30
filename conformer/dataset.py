@@ -8,6 +8,10 @@ import librosa
 from pathlib import Path
 from io import BytesIO
 
+# Constants for padding
+MAX_AUDIO_LEN = 235008
+MAX_LABEL_LEN = 164
+
 
 def pack_speech_data(audio_bytes, metadata):
     serialized_metadata = pickle.dumps(metadata)
@@ -79,7 +83,7 @@ class ProcessAudioData(grain.transforms.Map):
     def map(self, element: bytes):
         metadata, audio_bytes = unpack_speech_data(element)
         data = BytesIO(audio_bytes)
-        sig, sr = librosa.load(data, sr=None)
+        sig, sr = librosa.load(data, sr=16000)
         metadata["audio"] = sig
         metadata["label"] = self.tokenizer.encode(metadata["label"])
         return metadata

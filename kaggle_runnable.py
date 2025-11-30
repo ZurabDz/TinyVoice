@@ -4,7 +4,7 @@ from conformer.dataset import batch_fn, ProcessAudioData, unpack_speech_data
 import grain
 from functools import partial
 from conformer.conformer_block import ConformerEncoder
-from conformer.config import ConformerConfig, TrainingConfig
+from conformer.config import ConformerConfig, TrainingConfig, FeaturizerConfig
 from flax import nnx
 import jax.numpy as jnp
 import optax
@@ -12,12 +12,13 @@ import jax
 
 conformer_config = ConformerConfig()
 train_config = TrainingConfig()
+feat_cfg = FeaturizerConfig()
 
 
-tokenizer = Tokenizer.load('/kaggle/input/tok/pytorch/default/1/tokenizer.json')
+tokenizer = Tokenizer.load('/home/penguin/Desktop/TinyVoice/tokenizer/tokenizer.json')
 
-train_audio_source = grain.sources.ArrayRecordDataSource('./data/train/data.array_record')
-test_audio_source = grain.sources.ArrayRecordDataSource('./data/test/data.array_record')
+train_audio_source = grain.sources.ArrayRecordDataSource('/home/penguin/Data/processed/train.array_record')
+test_audio_source = grain.sources.ArrayRecordDataSource('/home/penguin/Data/processed/test.array_record')
 tokenizer_batch_fn = partial(batch_fn, tokenizer=tokenizer)
 
 map_train_audio_dataset = grain.MapDataset.source(train_audio_source)
@@ -28,7 +29,7 @@ processed_train_dataset = (
     .shuffle(seed=42)
     .map(ProcessAudioData(tokenizer))
     .batch(batch_size=48, batch_fn=tokenizer_batch_fn)
-    .repeat(5)
+    .repeat(1)
 )
 
 processed_test_dataset = (
@@ -37,7 +38,7 @@ processed_test_dataset = (
     .batch(batch_size=48, batch_fn=tokenizer_batch_fn)
 )
 
-model = ConformerEncoder(conformer_config, num_classes=42, rngs=nnx.Rngs(0))
+model = ConformerEncoder(conformer_config, feat_cfg, num_classes=tokenizer.vocab_size, rngs=nnx.Rngs(0))
 
 from conformer.train_utils import (
     create_learning_rate_fn,
@@ -45,23 +46,29 @@ from conformer.train_utils import (
     eval_step
 )
 
-lr_schedule = create_learning_rate_fn(train_config.warmup_steps, conformer_config.encoder_dim)
+lr_schedule = create_learning_rate_fn(train_config.warmup_steps, train_config.learning_rate)
 optimizer = nnx.Optimizer(
     model,
-    optax.adamw(
-        learning_rate=lr_schedule,
-        b1=train_config.beta1,
-        b2=train_config.beta2,
-        weight_decay=train_config.weight_decay,
+    optax.chain(
+        optax.clip_by_global_norm(train_config.max_grad_norm),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=train_config.beta1,
+            b2=train_config.beta2,
+            weight_decay=train_config.weight_decay,
+        ),
     ),
     wrt=nnx.Param
 )
 
-loss = train_step(model, optimizer, processed_train_dataset[0])
+graphdef, state = nnx.split((model, optimizer))
+
+loss, state = train_step(graphdef, state, processed_train_dataset[0])
 
 
 from clu import metric_writers
-from tqdm.notebook import tqdm
+# from tqdm.notebook import tqdm
+from tqdm import tqdm
 
 
 logdir = './metrics'
@@ -77,19 +84,21 @@ n_steps_for_eval = 1000
 for step_count, batch in tqdm(enumerate(processed_train_dataset, 1),
                             total=len(processed_train_dataset), desc="training loop", colour="green"):
     
-    loss = train_step(model, optimizer, batch)
+    loss, state = train_step(graphdef, state, batch)
     total_loss_accumulator += loss.item()
 
     if step_count % n_steps_to_save_avg_train_loss == 0:
         avg_loss = total_loss_accumulator / n_steps_to_save_avg_train_loss
         writer.write_scalars(step_count, {'train_loss': avg_loss})
+        print(f"Step {step_count}: train_loss = {avg_loss:.4f}")
         total_loss_accumulator = 0
 
     if step_count % n_steps_for_eval == 0:
         total_eval_loss_accumulator = 0
         for eval_batch in tqdm(processed_test_dataset, desc='eval loop', colour='blue', leave=False):
-            eval_loss = eval_step(model, batch)
+            eval_loss = eval_step(graphdef, state, eval_batch)
             total_eval_loss_accumulator += eval_loss
 
         avg_eval_loss = total_eval_loss_accumulator / len(processed_test_dataset)
         writer.write_scalars(step_count, {'eval_loss': avg_eval_loss})
+        print(f"Step {step_count}: eval_loss = {avg_eval_loss:.4f}")
