@@ -68,6 +68,7 @@ class ConformerBlock(nnx.Module):
         self.training = training
         self.residual_factor = feed_forward_residual_factor
         self.ff1 = FeedForwardBlock(d_model, feed_forward_expansion_factor, dropout, rngs=rngs)
+        self.ln_before_attention = nnx.LayerNorm(d_model, rngs=rngs)
         self.attention = nnx.MultiHeadAttention(num_head, d_model, dropout_rate=dropout, decode=False, rngs=rngs)
         self.conv_block = ConvBlock(d_model, dropout=dropout, rngs=rngs)
         self.ff2 = FeedForwardBlock(d_model, feed_forward_expansion_factor, dropout, rngs=rngs)
@@ -76,7 +77,7 @@ class ConformerBlock(nnx.Module):
 
     def __call__(self, x, mask=None):
         x = x + (self.residual_factor * self.ff1(x))
-        x = x + self.attention(x, mask=mask, deterministic=not self.training)
+        x = x + self.attention(self.ln_before_attention(x), mask=mask, deterministic=not self.training)
         x = x + self.conv_block(x)
         x = x + (self.residual_factor * self.ff2(x))
         return self.layer_norm(x)
