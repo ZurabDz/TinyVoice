@@ -1,6 +1,26 @@
 from flax import nnx
 import jax.numpy as jnp
 from .mel import MelSpectrogram
+import numpy as np
+
+
+class PositionalEncoding(nnx.Module):
+    def __init__(self, d_model: int, max_len: int = 2000):
+        self.d_model = d_model
+        
+        pe = np.zeros((max_len, d_model))
+        position = np.arange(0, max_len)[:, np.newaxis]
+        div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = np.sin(position * div_term)
+        pe[:, 1::2] = np.cos(position * div_term)
+        
+        # pe is (max_len, d_model)
+        self.pe = jnp.array(pe, dtype=jnp.float32)
+
+    def __call__(self, x: jnp.ndarray):
+        # x is (B, T, D)
+        return x + self.pe[:x.shape[1], :]
 
 
 class Conv2dSubSampler(nnx.Module):
@@ -96,6 +116,7 @@ class ConformerEncoder(nnx.Module):
 
         self.layers = nnx.List([ConformerBlock(d_model=d_model, feed_forward_residual_factor=feed_forward_residual_factor, feed_forward_expansion_factor=feed_forward_expansion_factor,
                                                num_head=num_head, dropout=dropout, rngs=rngs) for _ in range(num_layers)])
+        self.pos_encoding = PositionalEncoding(d_model=d_model)
         self.decoder = nnx.Linear(d_model, token_count, rngs=rngs)
         
 
@@ -103,6 +124,7 @@ class ConformerEncoder(nnx.Module):
         x = self.mel_spectogram(x, training)
         x = self.conv_subsampler(x[:, :, :, None])
         x = self.linear_proj(x)
+        x = self.pos_encoding(x)
         x = self.dropout(x)
 
         for layer in self.layers:
