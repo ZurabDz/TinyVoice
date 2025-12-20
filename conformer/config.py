@@ -7,12 +7,8 @@ class TrainingConfig:
     learning_rate: float = 5e-4
     beta1: float = 0.9
     beta2: float = 0.98
-    weight_decay: float = 1e-4
     epochs: int = 10
     batch_size: int = 16
-    warmup_steps: int = 150  # No warmup - use constant LR from start
-    max_grad_norm: float = 1.0
-
 
 @dataclass
 class FeaturizerConfig:
@@ -22,15 +18,6 @@ class FeaturizerConfig:
     hop_length: int = 160
     n_mels: int = 80
     dither: float = 0.00001
-
-
-@dataclass
-class SpecAugmentConfig:
-    freq_mask_param: int = 27
-    n_freq_masks: int = 2
-    time_mask_param: int = 100
-    n_time_masks: int = 2
-
 
 @dataclass
 class ConformerConfig:

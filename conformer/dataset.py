@@ -7,10 +7,8 @@ import grain
 import librosa
 from pathlib import Path
 from io import BytesIO
-
-# Constants for padding
-MAX_AUDIO_LEN = 235008
-MAX_LABEL_LEN = 164
+import io
+import soundfile as sf
 
 
 def pack_speech_data(audio_bytes, metadata):
@@ -51,39 +49,45 @@ def create_array_record_dataset(df, root_path: Path):
     writer.close()
 
 
-def batch_fn(batch, tokenizer):
-    audios = [item["audio"] for item in batch]
-    labels = [item["label"] for item in batch]
-
-    input_lengths = [len(x) for x in audios]
-    label_lengths = [len(x) for x in labels]
-
-    # FIXME: fix magic numbers
-    padded_audios = np.zeros((len(batch), 235008), dtype=np.float32)
-    padded_labels = np.full((len(batch), 164), tokenizer.blank_id, dtype=np.int32)
-
-    for i, (audio, label) in enumerate(zip(audios, labels)):
-        padded_audios[i, : len(audio)] = audio
-        padded_labels[i, : len(label)] = label
-
-    result = {
-        "inputs": padded_audios,
-        "input_lengths": np.asarray(input_lengths),
-        "labels": np.asarray(padded_labels),
-        "label_lengths": np.asarray(label_lengths),
-    }
-
-    return result
-
-
 class ProcessAudioData(grain.transforms.Map):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
     def map(self, element: bytes):
         metadata, audio_bytes = unpack_speech_data(element)
-        data = BytesIO(audio_bytes)
-        sig, sr = librosa.load(data, sr=16000)
+        # data = BytesIO(audio_bytes)
+        # sig, sr = librosa.load(data, sr=None)
+        with io.BytesIO(audio_bytes) as fh:
+            sig, sr = sf.read(fh, dtype='float32')
         metadata["audio"] = sig
         metadata["label"] = self.tokenizer.encode(metadata["label"])
         return metadata
+
+def round_up(n, multiple):
+    return ((n + multiple - 1) // multiple) * multiple
+
+def batch_fn(data):
+    batch_size = len(data)
+    max_frames = 235008
+    max_label_len = 164
+
+    # Pre-allocate numpy arrays once
+    padded_audios = np.zeros((batch_size, max_frames), dtype=np.float32)
+    padded_labels = np.zeros((batch_size, max_label_len), dtype=np.int32)
+    frames = np.zeros(batch_size, dtype=np.int32)
+    label_lengths = np.zeros(batch_size, dtype=np.int32)
+
+    for i, item in enumerate(data):
+        audio = item['audio']
+        label = item['label']
+        
+        # Clip if audio is longer than max_frames to prevent crash
+        l = min(len(audio), max_frames)
+        padded_audios[i, :l] = audio[:l]
+        frames[i] = l
+        
+        ll = min(len(label), max_label_len)
+        padded_labels[i, :ll] = label[:ll]
+        label_lengths[i] = ll
+
+    return padded_audios, frames, padded_labels, label_lengths

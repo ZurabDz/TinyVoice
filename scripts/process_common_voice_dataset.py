@@ -7,15 +7,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import argparse
 import string
-
+import numpy as np
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=Path, required=True, help="root path for common voice dataset")
+parser.add_argument('--tsv_filename', type=Path, required=True, help="tsv file from which we generate a data")
 parser.add_argument('--output_file_name', type=str, required=False, default='validated_processed.tsv')
 parser.add_argument('--max_workers', type=int, required=False, default=min(14, os.cpu_count() or 1))
 
 
-args = parser.parse_args('--root_path /home/penguin/data/ka/'.split(' '))
+args = parser.parse_args('--root_path /home/penguin/data/ka --tsv_filename validated.tsv'.split(' '))
 # args = parser.parse_args()
 
 MAX_WORKERS = args.max_workers
@@ -23,7 +24,10 @@ ROOT_PATH = args.root_path
 RESAMPLED_AUDIOS_PATH = args.root_path / 'clips_16k'
 RESAMPLED_AUDIOS_PATH.mkdir(exist_ok=True)
 
-dataset = pd.read_csv(ROOT_PATH / 'validated.tsv', sep='\t', usecols=['path', 'sentence'])
+# only grab coloumns we need
+dataset = pd.read_csv(ROOT_PATH / args.tsv_filename, sep='\t', usecols=['path', 'sentence'])
+
+# chaning relative path to full path
 dataset['path'] = dataset['path'].apply(lambda path: ROOT_PATH / 'clips' / path)
 
 
@@ -61,7 +65,9 @@ with ProcessPoolExecutor(max_workers=MAX_WORKERS) as workers:
 
 
 new_df = pd.DataFrame.from_dict(new_df_data_source)
-processed_audios = new_df[['path', 'label', 'frames']]
+processed_audios = new_df[['path', 'label', 'frames']].copy()
 remove_punct_map = dict.fromkeys(map(ord, string.punctuation))
 processed_audios['label'] = processed_audios['label'].str.translate(remove_punct_map).str.strip()
+processed_audios['label'] = processed_audios['label'].replace('', np.nan)
+processed_audios.dropna(inplace=True)
 processed_audios.to_csv(ROOT_PATH / args.output_file_name, sep='\t', index=False)

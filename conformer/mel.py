@@ -21,7 +21,7 @@ class MelSpectrogram(nnx.Module):
         log_epsilon: float = 1e-10,
         dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs = None,
-        dither: float = None,
+        dither: float = 0.00001,
     ):
 
         self.sample_rate = sample_rate

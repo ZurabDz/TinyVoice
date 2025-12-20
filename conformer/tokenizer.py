@@ -1,63 +1,44 @@
-import json
 from pathlib import Path
-
+import pandas as pd
+import numpy as np
+import pickle
 
 class Tokenizer:
-    def __init__(self, vocab: list[str]):
-        self.char_to_id = {c: i for i, c in enumerate(vocab)}
-        self.id_to_char = {i: c for i, c in enumerate(vocab)}
-        self.blank_id = self.char_to_id["<pad>"]
+    def __init__(self, file_path: Path):
+        self.file_path = file_path
+        self.char_to_id = {}
+        self.id_to_char = {}
+        self.blank_id = None
+        self._construct_tokenizer()
 
-    @property
-    def vocab_size(self):
-        return len(self.char_to_id)
+    def encode(self, text: str):
+        try:
+            return np.array([self.char_to_id[ch] for ch in text])
+        except Exception as e:
+            print(text)
+            raise e
 
-    def encode(self, text: str) -> list[int]:
-        return [self.char_to_id.get(c, self.char_to_id["<unk>"]) for c in text.lower()]
+    def decode(self, ids: int):
+        return [self.id_to_char[_id] for _id in ids]
 
-    def decode(self, ids: list[int]) -> str:
-        # CTC decode: remove blanks and duplicates
-        last_char_id = self.blank_id
-        decoded_chars = []
-        for char_id in ids:
-            if char_id != self.blank_id and char_id != last_char_id:
-                decoded_chars.append(self.id_to_char[char_id])
-            last_char_id = char_id
-        return "".join(decoded_chars)
+    def _construct_tokenizer(self):
+        df = pd.read_csv(self.file_path, sep='\t')
+        all_words = []
+        for words in df['label'].str.split():
+            all_words.extend(words)
 
-    def save(self, path: Path, name: str = "tokenizer.json") -> None:
-        with open(path / name, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "char_to_id": self.char_to_id,
-                    "id_to_char": {str(k): v for k, v in self.id_to_char.items()},
-                    "blank_id": self.blank_id,
-                },
-                f,
-                ensure_ascii=False,
-            )
+        combined_words = sorted(set(' '.join(all_words)))
 
-    @classmethod
-    def load(cls, path):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            id_to_char = {int(k): v for k, v in data["id_to_char"].items()}
-            vocab = [id_to_char[i] for i in range(len(id_to_char))]
-            tokenizer = cls(vocab)
-            tokenizer.char_to_id = data["char_to_id"]
-            tokenizer.id_to_char = id_to_char
-            tokenizer.blank_id = data["blank_id"]
-            return tokenizer
+        self.id_to_char[0] = '<BLANK>'
+        self.blank_id = 0
+        for i, char in enumerate(combined_words, 1):
+            self.char_to_id[char] = i
+            self.id_to_char[i] = char
 
 
-def build_tokenizer(data):
-    def get_common_voice_vocab(dataset):
-        # build vocabulary from training data
-        text = " ".join([label for label in dataset])
-        vocab = sorted(list(set(text.lower())))
-        vocab = ["<pad>", "<unk>"] + vocab
-        print(f"Vocabulary size: {len(vocab)}")
-        return vocab
+    def save_tokenizer(self, save_path: Path):
+        pickle.dump(self, open(save_path / 'tokenizer.pkl', 'wb'))
 
-    vocab = get_common_voice_vocab(data)
-    return Tokenizer(vocab)
+    @staticmethod
+    def load_tokenizer(path: Path):
+        return pickle.load(open(path, 'rb'))

@@ -1,22 +1,17 @@
 [project]
-name = "tinyvoice"
+name = "tiny"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "black>=25.9.0",
-    "clu>=0.0.12",
-    "flax>=0.12.0",
-    "grain>=0.2.12",
-    "ipykernel>=6.30.1",
-    "ipywidgets>=8.1.7",
-    "jax[cuda12]==0.7.1",
-    "jiwer>=4.0.0",
+    "flax>=0.12.1",
+    "grain>=0.2.15",
+    "iprogress>=0.4",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
+    "jax[cuda12]>=0.8.1",
     "librosa>=0.11.0",
-    "pandas>=2.3.2",
-    "tensorboard>=2.20.0",
-    "tensorflow>=2.20.0",
+    "pandas>=2.3.3",
     "tqdm>=4.67.1",
-    "xprof>=2.20.6",
 ]
