@@ -22,6 +22,10 @@ class MelSpectrogram(nnx.Module):
         dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs = None,
         dither: float = 0.00001,
+        freq_mask_param: int = 27,
+        time_mask_param: int = 100,
+        n_freq_masks: int = 2,
+        n_time_masks: int = 2,
     ):
 
         self.sample_rate = sample_rate
@@ -36,6 +40,10 @@ class MelSpectrogram(nnx.Module):
         self.dtype = dtype
         self.rngs = rngs
         self.dither = dither
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
+        self.n_freq_masks = n_freq_masks
+        self.n_time_masks = n_time_masks
 
         # Create and store the mel filterbank as a static parameter
         mel_fb = librosa.filters.mel(
@@ -78,6 +86,39 @@ class MelSpectrogram(nnx.Module):
 
             return log_mel_spectrogram
 
+        def apply_spec_augment(spec, key):
+            # spec: (Time, Mels)
+            t_len, f_len = spec.shape
+            
+            for _ in range(self.n_freq_masks):
+                key, subkey = jax.random.split(key)
+                f = jax.random.randint(subkey, (), 0, self.freq_mask_param)
+                f0 = jax.random.randint(subkey, (), 0, f_len - f)
+                mask = jnp.logical_and(jnp.arange(f_len) >= f0, jnp.arange(f_len) < f0 + f)
+                spec = jnp.where(mask[None, :], 0.0, spec)
+                
+            for _ in range(self.n_time_masks):
+                key, subkey = jax.random.split(key)
+                t = jax.random.randint(subkey, (), 0, self.time_mask_param)
+                t0 = jax.random.randint(subkey, (), 0, t_len - t)
+                mask = jnp.logical_and(jnp.arange(t_len) >= t0, jnp.arange(t_len) < t0 + t)
+                spec = jnp.where(mask[:, None], 0.0, spec)
+                
+            return spec
+
         # Use jax.vmap to process the batch of waveforms
         batched_mel_spectrogram_fn = jax.vmap(process_single_waveform)
-        return batched_mel_spectrogram_fn(waveforms)
+        specs = batched_mel_spectrogram_fn(waveforms)
+        
+        # Normalization (per-sequence/per-channel approx)
+        # For simplicity, we use global mean/std normalization across the batch features
+        mean = jnp.mean(specs, axis=(1, 2), keepdims=True)
+        std = jnp.std(specs, axis=(1, 2), keepdims=True) + 1e-6
+        specs = (specs - mean) / std
+        
+        if training:
+            key = self.rngs.fork().default.key.value
+            batch_keys = jax.random.split(key, waveforms.shape[0])
+            specs = jax.vmap(apply_spec_augment)(specs, batch_keys)
+            
+        return specs
