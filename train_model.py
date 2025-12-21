@@ -23,7 +23,6 @@ map_test_audio_dataset = grain.MapDataset.source(test_audio_source)
 
 
 batch_size = 48
-steps_per_epoch = len(map_train_audio_dataset) // batch_size
 num_epochs = 5
 
 processed_train_dataset = (
@@ -36,7 +35,7 @@ processed_train_dataset = (
 processed_test_dataset = (
     map_test_audio_dataset
     .map(ProcessAudioData(tokenizer))
-    .batch(batch_size=batch_size, batch_fn=batch_fn)
+    .batch(batch_size=12, batch_fn=batch_fn)
 )
 
 
@@ -125,28 +124,35 @@ def jitted_train(model, optimizer, padded_audios, padded_labels, frames, label_l
 
 @nnx.jit
 def jitted_validation(model, padded_audios, padded_labels, frames, label_lengths):
-    t_mel = (frames - 400) // 160 + 1
-    t_conv1 = (t_mel - 3) // 2 + 1
-    t_final = (t_conv1 - 3) // 2 + 1
+    def compute_mask_internal(frames):
+        t_mel = (frames - 400) // 160 + 1
+        t_conv1 = (t_mel - 3) // 2 + 1
+        t_final = (t_conv1 - 3) // 2 + 1
+        
+        max_t_final = 366  # Based on max_frames = 235008
+        real_times = t_final
+        
+        mask = jnp.arange(max_t_final) < real_times[:, None]
+        mask = jnp.expand_dims(mask, axis=1).repeat(max_t_final, axis=1)
+        mask = jnp.expand_dims(mask, axis=1).repeat(4, axis=1)
+        return mask, real_times
     
-    max_t_final = 366
-    real_times = t_final
-    
-    mask = jnp.arange(max_t_final) < real_times[:, None]
-    mask = jnp.expand_dims(mask, axis=1).repeat(max_t_final, axis=1)
-    mask = jnp.expand_dims(mask, axis=1).repeat(4, axis=1)
+    def loss_fn(model):
+        mask, real_times = compute_mask_internal(frames)
+        
+        logits = model(padded_audios, mask=mask, training=False)
+        
+        audio_time_mask = jnp.arange(logits.shape[1]) >= real_times[:, None]
+        label_mask = jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
+        
+        loss = optax.ctc_loss(logits, audio_time_mask, padded_labels, label_mask).mean()
+        return loss
 
-    logits = model(padded_audios, mask=mask, training=False)
-    
-    audio_time_mask = jnp.arange(logits.shape[1]) >= real_times[:, None]
-    label_mask = jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
-    
-    loss = optax.ctc_loss(logits, audio_time_mask, padded_labels, label_mask).mean()
+    loss = loss_fn(model)
     return loss
 
 
 padded_audios, frames, padded_labels, label_lengths = processed_train_dataset[0]
-
 
 z = jitted_train(model, optimizer, padded_audios, padded_labels, frames, label_lengths)
 
@@ -157,14 +163,12 @@ global_step = 0
 if manager.latest_step() is not None:
     global_step = manager.latest_step()
 
-# steps_per_epoch = 100
-# Dynamically calculate steps per epoch
-# steps_per_epoch = len(map_train_audio_dataset) // batch_size
-steps_per_epoch = 100
+steps_per_epoch = (len(map_train_audio_dataset) // batch_size) * 1
 
 print(f"Steps per epoch: {steps_per_epoch}")
 
-for i, element in enumerate(tqdm(processed_train_dataset)):
+pbar = tqdm(processed_train_dataset, total=len(processed_train_dataset))
+for i, element in enumerate(pbar):
     padded_audios, frames, padded_labels, label_lengths = element
 
     loss = jitted_train(model, optimizer, padded_audios, padded_labels, frames, label_lengths)
@@ -173,30 +177,29 @@ for i, element in enumerate(tqdm(processed_train_dataset)):
     global_step += 1
     
     if (i + 1) % 100 == 0:
-        print(f"Step {global_step}, Train Loss: {avg_loss / 100:.4f}")
+        pbar.set_postfix({"loss": f"{avg_loss / 100:.4f}"})
         avg_loss = 0
 
     # Validation and Checkpointing at the end of each epoch
     if (i + 1) % steps_per_epoch == 0:
         epoch = (i + 1) // steps_per_epoch
-        print(f"\nEnd of Epoch {epoch}. Running validation...")
+        tqdm.write(f"\nEnd of Epoch {epoch}. Running validation...")
         
-        val_loss = 0
+        val_losses = 0  # Use a list instead of accumulating scalars
         val_steps = 0
-        for i, val_element in enumerate(tqdm(processed_test_dataset, desc="Validation")):
-            v_padded_audios, v_frames, v_padded_labels, v_label_lengths = val_element
-            
-            v_loss = jitted_validation(model, v_padded_audios, v_padded_labels, v_frames, v_label_lengths)
-            v_loss.block_until_ready() # Force sync to prevent op queue buildup
-            val_loss += float(v_loss)
-            val_steps += 1
         
-        if val_steps > 0:
-            avg_val_loss = val_loss / val_steps
-            print(f"Epoch {epoch} Validation Loss: {avg_val_loss:.4f}")
-
-        # Checkpointing
-        print(f"Saving checkpoint at step {global_step}...")
+        val_pbar = tqdm(processed_test_dataset, desc="Validation", leave=False)
+        for val_idx, val_element in enumerate(val_pbar):
+            v_padded_audios, v_frames, v_padded_labels, v_label_lengths = val_element
+            v_loss = jitted_validation(model, v_padded_audios, v_padded_labels, v_frames, v_label_lengths)
+            val_losses += float(v_loss)
+            val_steps += 1
+            if (val_idx + 1) % 50 == 0:
+                val_pbar.set_postfix({"v_loss": f"{val_losses / val_steps:.4f}"})
+        
+        tqdm.write(f"Epoch {epoch} Validation Loss: {val_losses / val_steps:.4f}")
+        
+        tqdm.write(f"Saving checkpoint at step {global_step}...")
         manager.save(
             global_step,
             args=ocp.args.Composite(
