@@ -31,10 +31,9 @@ def unpack_speech_data(combined_data):
     return parsed_metadata, parsed_file_data
 
 
-def create_array_record_dataset(df, root_path: Path):
-    example_file_path = root_path / "data.array_record"
+def create_array_record_dataset(df, save_path: Path):
     writer = array_record_module.ArrayRecordWriter(
-        str(example_file_path), "group_size:1"
+        str(save_path), "group_size:1"
     )
 
     record_count = 0

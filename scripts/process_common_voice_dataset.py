@@ -9,31 +9,9 @@ import argparse
 import string
 import numpy as np
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--root_path', type=Path, required=True, help="root path for common voice dataset")
-parser.add_argument('--tsv_filename', type=Path, required=True, help="tsv file from which we generate a data")
-parser.add_argument('--output_file_name', type=str, required=False, default='validated_processed.tsv')
-parser.add_argument('--max_workers', type=int, required=False, default=min(14, os.cpu_count() or 1))
-
-
-args = parser.parse_args('--root_path /home/penguin/data/ka --tsv_filename validated.tsv'.split(' '))
-# args = parser.parse_args()
-
-MAX_WORKERS = args.max_workers
-ROOT_PATH = args.root_path
-RESAMPLED_AUDIOS_PATH = args.root_path / 'clips_16k'
-RESAMPLED_AUDIOS_PATH.mkdir(exist_ok=True)
-
-# only grab coloumns we need
-dataset = pd.read_csv(ROOT_PATH / args.tsv_filename, sep='\t', usecols=['path', 'sentence'])
-
-# chaning relative path to full path
-dataset['path'] = dataset['path'].apply(lambda path: ROOT_PATH / 'clips' / path)
-
-
 def resample_and_write(row: tuple, dst_path: Path) -> tuple[str, None | Exception]:
     """
-    resamples given audio, writes it to destionation and returns old path, error, new path, label, frames
+    resamples given audio, writes it to destination and returns old path, error, new path, label, frames
     """
     try:
         old_path, label = row[1].values
@@ -43,31 +21,53 @@ def resample_and_write(row: tuple, dst_path: Path) -> tuple[str, None | Exceptio
         return old_path, None, saved_path, label, sig.shape[0]
     except Exception as e:
         return old_path, e, None, None, None
+
+def process_tsv(tsv_filename: Path, root_path: Path, resampled_path: Path, max_workers: int):
+    print(f"Processing {tsv_filename}...")
+    # only grab columns we need
+    dataset = pd.read_csv(root_path / tsv_filename, sep='\t', usecols=['path', 'sentence'])
+
+    # changing relative path to full path
+    dataset['path'] = dataset['path'].apply(lambda path: root_path / 'clips' / path)
+
+    new_df_data_source = {'old_path': [], 'error': [], 'path': [], 'label': [], 'frames': []}
+    with ProcessPoolExecutor(max_workers=max_workers) as workers:
+        futures = {workers.submit(resample_and_write, row, resampled_path) 
+                for row in dataset.iterrows()}
+        for future in tqdm(as_completed(futures), total=len(futures)):
+            old_path, error, saved_path, label, frames = future.result()
+            if error:
+                print(f'something wrong with processing an audio: {old_path}, error is: {error}')
+
+            new_df_data_source['old_path'].append(old_path)
+            new_df_data_source['error'].append(error)
+            new_df_data_source['path'].append(saved_path)
+            new_df_data_source['label'].append(label)
+            new_df_data_source['frames'].append(frames)
+
+    new_df = pd.DataFrame.from_dict(new_df_data_source)
+    processed_audios = new_df[['path', 'label', 'frames']].copy()
+    remove_punct_map = dict.fromkeys(map(ord, string.punctuation + '–—“”„'))
+    processed_audios['label'] = processed_audios['label'].str.translate(remove_punct_map).str.strip().str.lower()
+    processed_audios['label'] = processed_audios['label'].replace('', np.nan)
+    processed_audios.dropna(inplace=True)
     
+    output_filename = tsv_filename.stem + "_processed.tsv"
+    processed_audios.to_csv(root_path / output_filename, sep='\t', index=False)
+    print(f"Finished processing {tsv_filename}. Output saved to {output_filename}")
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root_path', type=Path, required=True, help="root path for common voice dataset")
+    parser.add_argument('--tsv_filenames', type=Path, nargs='+', required=True, help="tsv files from which we generate data")
+    parser.add_argument('--max_workers', type=int, required=False, default=min(14, os.cpu_count() or 1))
 
-new_df_data_source = {'old_path': [], 'error': [], 'path': [], 'label': [], 'frames': []}
-with ProcessPoolExecutor(max_workers=MAX_WORKERS) as workers:
-    futures = {workers.submit(resample_and_write, row, RESAMPLED_AUDIOS_PATH) 
-               for row in dataset.iterrows()}
-    for future in tqdm(as_completed(futures), total=len(futures)):
-        old_path, error, saved_path, label, frames = future.result()
-        if error:
-            print(f'something wrong with processing an audio: {old_path}, error is: {error}')
+    args = parser.parse_args()
 
+    MAX_WORKERS = args.max_workers
+    ROOT_PATH = args.root_path
+    RESAMPLED_AUDIOS_PATH = args.root_path / 'clips_16k'
+    RESAMPLED_AUDIOS_PATH.mkdir(exist_ok=True)
 
-        new_df_data_source['old_path'].append(old_path)
-        new_df_data_source['error'].append(error)
-        new_df_data_source['path'].append(saved_path)
-        new_df_data_source['label'].append(label)
-        new_df_data_source['frames'].append(frames)
-
-
-
-new_df = pd.DataFrame.from_dict(new_df_data_source)
-processed_audios = new_df[['path', 'label', 'frames']].copy()
-remove_punct_map = dict.fromkeys(map(ord, string.punctuation))
-processed_audios['label'] = processed_audios['label'].str.translate(remove_punct_map).str.strip()
-processed_audios['label'] = processed_audios['label'].replace('', np.nan)
-processed_audios.dropna(inplace=True)
-processed_audios.to_csv(ROOT_PATH / args.output_file_name, sep='\t', index=False)
+    for tsv_file in args.tsv_filenames:
+        process_tsv(tsv_file, ROOT_PATH, RESAMPLED_AUDIOS_PATH, MAX_WORKERS)

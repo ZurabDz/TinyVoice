@@ -1,25 +1,36 @@
 import sys
-sys.path.append('..')
+from pathlib import Path
+
+# Add the parent directory to sys.path to import from conformer
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from conformer.dataset import create_array_record_dataset
 import pandas as pd
 import argparse
-from pathlib import Path
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--processed_tsv_path', type=Path, required=True)
-parser.add_argument('--packed_dataset_save_path', type=Path, required=True)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--processed_tsv_paths', type=Path, nargs='+', required=True, help="List of processed TSV files")
+    parser.add_argument('--save_dir', type=Path, required=True, help="Directory to save packed datasets")
 
+    args = parser.parse_args()
 
-# args = parser.parse_args()
+    args.save_dir.mkdir(parents=True, exist_ok=True)
 
-args = parser.parse_args('--processed_tsv_path /home/penguin/data/tinyvoice/data/validated_processed.tsv' \
-' --packed_dataset_save_path /home/penguin/data/tinyvoice/data'.split())
+    for tsv_path in args.processed_tsv_paths:
+        if not tsv_path.exists():
+            print(f"Warning: {tsv_path} does not exist. Skipping.")
+            continue
 
-# args = parser.parse_args('--processed_tsv_path /home/penguin/data/ka/test_processed.tsv' \
-# ' --packed_dataset_save_path /home/penguin/data/packed_dataset/test'.split())
+        print(f"Packing data from {tsv_path}...")
+        df = pd.read_csv(tsv_path, sep='\t')
+        
+        # Use the name of the TSV file (without extension and "_processed") for the packed filename
+        base_name = tsv_path.stem.replace("_processed", "")
+        save_path = args.save_dir / f"{base_name}.array_record"
+        
+        create_array_record_dataset(df, save_path)
+        print(f"Packed dataset saved to {save_path}")
 
-df = pd.read_csv(args.processed_tsv_path, sep='\t')
-
-args.packed_dataset_save_path.mkdir(exist_ok=True)
-create_array_record_dataset(df, args.packed_dataset_save_path)
+if __name__ == "__main__":
+    main()
