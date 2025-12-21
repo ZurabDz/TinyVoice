@@ -116,9 +116,9 @@ class MelSpectrogram(nnx.Module):
         std = jnp.std(specs, axis=(1, 2), keepdims=True) + 1e-6
         specs = (specs - mean) / std
         
-        # if training:
-        #     key = self.rngs.fork().default.key.value
-        #     batch_keys = jax.random.split(key, waveforms.shape[0])
-        #     specs = jax.vmap(apply_spec_augment)(specs, batch_keys)
+        if training:
+            key = self.rngs.fork().default.key.value
+            batch_keys = jax.random.split(key, waveforms.shape[0])
+            specs = jax.vmap(apply_spec_augment)(specs, batch_keys)
             
         return specs

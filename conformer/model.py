@@ -41,36 +41,43 @@ class Conv2dSubSampler(nnx.Module):
 
 class FeedForwardBlock(nnx.Module):
     def __init__(self, d_model, expansion_factor, dropout, rngs: nnx.Rngs):
-        self.module = nnx.Sequential(
-            nnx.LayerNorm(d_model, rngs=rngs),
-            nnx.Linear(d_model, d_model * expansion_factor, rngs=rngs),
-            nnx.silu,
-            nnx.Dropout(rate=dropout, rngs=rngs),
-            nnx.Linear(d_model * expansion_factor, d_model, rngs=rngs),
-            nnx.Dropout(rate=dropout, rngs=rngs)
-        )
+        self.ln = nnx.LayerNorm(d_model, rngs=rngs)
+        self.lin1 = nnx.Linear(d_model, d_model * expansion_factor, rngs=rngs)
+        self.drop1 = nnx.Dropout(rate=dropout, rngs=rngs)
+        self.lin2 = nnx.Linear(d_model * expansion_factor, d_model, rngs=rngs)
+        self.drop2 = nnx.Dropout(rate=dropout, rngs=rngs)
 
-    def __call__(self, x):
-        return self.module(x)
+    def __call__(self, x, training=True):
+        x = self.ln(x)
+        x = self.lin1(x)
+        x = nnx.silu(x)
+        x = self.drop1(x, deterministic=not training)
+        x = self.lin2(x)
+        x = self.drop2(x, deterministic=not training)
+        return x
     
 
 class ConvBlock(nnx.Module):
     def __init__(self, d_model, dropout, rngs: nnx.Rngs):
         self.layer_norm = nnx.LayerNorm(d_model, rngs=rngs)
+        self.conv1 = nnx.Conv(in_features=d_model, out_features=d_model * 2, kernel_size=1, rngs=rngs)
+        self.conv2 = nnx.Conv(in_features=d_model, out_features=d_model, kernel_size=31, feature_group_count=d_model, rngs=rngs)
+        self.bn = nnx.BatchNorm(d_model, rngs=rngs)
+        self.conv3 = nnx.Conv(in_features=d_model, out_features=d_model, kernel_size=1, rngs=rngs)
+        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
-        self.module = nnx.Sequential(
-            nnx.Conv(in_features=d_model, out_features=d_model * 2, kernel_size=1, rngs=rngs),
-            nnx.glu,
-            nnx.Conv(in_features=d_model, out_features=d_model, kernel_size=31, feature_group_count=d_model, rngs=rngs),
-            nnx.BatchNorm(d_model, rngs=rngs),
-            nnx.silu,
-            nnx.Conv(in_features=d_model, out_features=d_model, kernel_size=1, rngs=rngs),
-            nnx.Dropout(rate=dropout, rngs=rngs)
-        )
-
-    def __call__(self, x):
+    def __call__(self, x, training=True):
         x = self.layer_norm(x)
-        x = self.module(x)
+        
+        x = self.conv1(x)
+        x = nnx.glu(x)
+        
+        x = self.conv2(x)
+        x = self.bn(x, use_running_average=not training)
+        x = nnx.silu(x)
+        
+        x = self.conv3(x)
+        x = self.dropout(x, deterministic=not training)
         return x
     
 
@@ -81,11 +88,9 @@ class ConformerBlock(nnx.Module):
           feed_forward_expansion_factor=4,
           num_head=4,
           dropout=0.1,
-          training=True,
           rngs: nnx.Rngs = None):
         if rngs is None:
             rngs = nnx.Rngs(0)
-        self.training = training
         self.residual_factor = feed_forward_residual_factor
         self.ff1 = FeedForwardBlock(d_model, feed_forward_expansion_factor, dropout, rngs=rngs)
         self.ln_before_attention = nnx.LayerNorm(d_model, rngs=rngs)
@@ -95,11 +100,11 @@ class ConformerBlock(nnx.Module):
         self.layer_norm = nnx.LayerNorm(d_model, rngs=rngs)
 
 
-    def __call__(self, x, mask=None):
-        x = x + (self.residual_factor * self.ff1(x))
-        x = x + self.attention(self.ln_before_attention(x), mask=mask, deterministic=not self.training)
-        x = x + self.conv_block(x)
-        x = x + (self.residual_factor * self.ff2(x))
+    def __call__(self, x, mask=None, training=True):
+        x = x + (self.residual_factor * self.ff1(x, training=training))
+        x = x + self.attention(self.ln_before_attention(x), mask=mask, deterministic=not training)
+        x = x + self.conv_block(x, training=training)
+        x = x + (self.residual_factor * self.ff2(x, training=training))
         return self.layer_norm(x)
     
 
@@ -128,7 +133,7 @@ class ConformerEncoder(nnx.Module):
         x = self.dropout(x)
 
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x, mask, training=training)
 
         return self.decoder(x)
     
