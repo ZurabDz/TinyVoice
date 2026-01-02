@@ -29,9 +29,16 @@ class Tokenizer:
 
         combined_words = sorted(set(' '.join(all_words)))
 
-        self.id_to_char[0] = '<BLANK>'
-        self.blank_id = 0
-        for i, char in enumerate(combined_words, 1):
+        self.id_to_char[0] = '<PADDING>'
+        self.padding_id = 0
+
+        self.id_to_char[1] = '<BLANK>'
+        self.blank_id = 1
+
+        self.char_to_id['<PADDING>'] = 0
+        self.char_to_id['<BLANK>'] = 1
+        
+        for i, char in enumerate(combined_words, 2):
             self.char_to_id[char] = i
             self.id_to_char[i] = char
 

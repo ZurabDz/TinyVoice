@@ -14,4 +14,5 @@ dependencies = [
     "librosa>=0.11.0",
     "pandas>=2.3.3",
     "tqdm>=4.67.1",
+    "xprof>=2.21.3",
 ]
