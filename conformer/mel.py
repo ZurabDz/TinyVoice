@@ -56,7 +56,7 @@ class MelSpectrogram(nnx.Module):
         )
         self.mel_filterbank = jnp.array(mel_fb, dtype=self.dtype)
 
-    def __call__(self, waveforms: jnp.ndarray, training) -> jnp.ndarray:
+    def __call__(self, waveforms: jnp.ndarray, training, lengths: Optional[jnp.ndarray] = None) -> jnp.ndarray:
         if training and self.dither > 0:
             key = self.rngs.fork().default.key.value
             rand_waves = jax.random.normal(
@@ -110,11 +110,34 @@ class MelSpectrogram(nnx.Module):
         batched_mel_spectrogram_fn = jax.vmap(process_single_waveform)
         specs = batched_mel_spectrogram_fn(waveforms)
         
-        # Normalization (per-sequence/per-channel approx)
-        # For simplicity, we use global mean/std normalization across the batch features
-        mean = jnp.mean(specs, axis=(1, 2), keepdims=True)
-        std = jnp.std(specs, axis=(1, 2), keepdims=True) + 1e-6
-        specs = (specs - mean) / std
+        # Normalization
+        if lengths is not None:
+             # Calculate valid mel lengths: (L - win) // hop + 1
+            mel_lengths = (lengths - self.win_length) // self.hop_length + 1
+            # Create mask: (Batch, Time, 1) to broadcast over Mels
+            max_time = specs.shape[1]
+            mask = jnp.arange(max_time)[None, :] < mel_lengths[:, None]
+            mask = mask[:, :, None].astype(specs.dtype)
+            
+            # Compute masked mean and std
+            # Avoid division by zero by adding epsilon to count
+            count = jnp.sum(mask, axis=(1, 2), keepdims=True) + 1e-6
+            mean = jnp.sum(specs * mask, axis=(1, 2), keepdims=True) / count
+            
+            # Variance: sum((x-mean)^2 * mask) / count
+            var = jnp.sum(jnp.square(specs - mean) * mask, axis=(1, 2), keepdims=True) / count
+            std = jnp.sqrt(var + 1e-6)
+            
+            # Normalize
+            # Apply mask to output to zero out padding (good practice)
+            specs = (specs - mean) / std
+            specs = specs * mask
+            
+        else:
+            # Fallback to naive normalization if lengths not provided (though discouraged)
+            mean = jnp.mean(specs, axis=(1, 2), keepdims=True)
+            std = jnp.std(specs, axis=(1, 2), keepdims=True) + 1e-6
+            specs = (specs - mean) / std
         
         if training:
             key = self.rngs.fork().default.key.value

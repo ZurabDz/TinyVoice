@@ -12,8 +12,8 @@ parser.add_argument('--processed_tsv_path', type=Path, required=True)
 parser.add_argument('--tokenizer_save_path', type=Path, required=True)
 # args = parser.parse_args()
 
-args = parser.parse_args('--processed_tsv_path /home/penguin/data/ka/train_processed.tsv'
-' --tokenizer_save_path /home/penguin/data/tinyvoice/tokenizer/ '.split())
+args_params = '--processed_tsv_path /home/penguin/data/ka/train_processed.tsv --tokenizer_save_path /home/penguin/data/ka/tokenizer/ '.split()
+args = parser.parse_args(args_params)
 
 tokenizer = Tokenizer(args.processed_tsv_path)
 

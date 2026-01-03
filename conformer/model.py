@@ -177,11 +177,13 @@ class ConformerEncoder(nnx.Module):
             ]
         )
         self.decoder = nnx.Linear(d_model, token_count, rngs=rngs)
+        self.d_model = d_model
 
-    def __call__(self, x, mask=None, training=True):
-        x = self.mel_spectogram(x, training)
+    def __call__(self, x, mask=None, training=True, inputs_lengths=None):
+        x = self.mel_spectogram(x, training, lengths=inputs_lengths)
         x = self.conv_subsampler(x[:, :, :, None])
         x = self.linear_proj(x)
+        x = x * jnp.sqrt(self.d_model)
         x = self.pos_encoding(x)
         x = self.dropout(x)
 

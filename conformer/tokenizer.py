@@ -12,11 +12,12 @@ class Tokenizer:
         self._construct_tokenizer()
 
     def encode(self, text: str):
-        try:
-            return np.array([self.char_to_id[ch] for ch in text])
-        except Exception as e:
-            print(text)
-            raise e
+        ids = []
+        for ch in text:
+            if ch in self.char_to_id:
+                ids.append(self.char_to_id[ch])
+            # If unknown, we skip it.
+        return np.array(ids)
 
     def decode(self, ids: int):
         return [self.id_to_char[_id] for _id in ids]
