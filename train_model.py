@@ -48,7 +48,8 @@ optimizer = nnx.Optimizer(
         learning_rate=lr_schedule,
         b1=0.9,
         b2=0.98,
-        weight_decay=1e-2
+        weight_decay=1e-2,
+        mask=lambda p: jax.tree.map(lambda x: x.ndim > 1, p)
     ),
     wrt=nnx.Param
 )
@@ -135,10 +136,10 @@ mask, real_times = compute_mask(frames)
 
 
 @nnx.jit
-def jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_times, label_lengths):
+def jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_times, frames, label_lengths):
     """Training step with gradient computation"""
     def loss_fn(model):
-        logits = model(padded_audios, mask=mask, training=True)
+        logits = model(padded_audios, mask=mask, training=True, inputs_lengths=frames)
         
         logit_paddings = (jnp.arange(logits.shape[1]) >= real_times[:, None]).astype(jnp.float32)
         label_paddings = (jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]).astype(jnp.float32)
@@ -151,9 +152,9 @@ def jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_time
     return loss
 
 @nnx.jit
-def jitted_eval(model, padded_audios, padded_labels, mask, real_times, label_lengths):
+def jitted_eval(model, padded_audios, padded_labels, mask, real_times, frames, label_lengths):
     """Evaluation step - no gradient computation"""
-    logits = model(padded_audios, mask=mask, training=False)
+    logits = model(padded_audios, mask=mask, training=False, inputs_lengths=frames)
     
     logit_paddings = (jnp.arange(logits.shape[1]) >= real_times[:, None]).astype(jnp.float32)
     label_paddings = (jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]).astype(jnp.float32)
@@ -170,7 +171,7 @@ def run_validation(model, val_dataset):
     for element in val_dataset:
         padded_audios, frames, padded_labels, label_lengths = element
         mask, real_times = compute_mask(frames)
-        loss = jitted_eval(model, padded_audios, padded_labels, mask, real_times, label_lengths)
+        loss = jitted_eval(model, padded_audios, padded_labels, mask, real_times, frames, label_lengths)
         total_loss += float(loss)
         num_batches += 1
     
@@ -179,7 +180,7 @@ def run_validation(model, val_dataset):
 
 
 # Warm up model
-loss = jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_times, label_lengths)
+loss = jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_times, frames, label_lengths)
 
 global_step = checkpointer.latest_step() or 0
 
@@ -195,7 +196,7 @@ for epoch in range(NUM_EPOCHS):
         padded_audios, frames, padded_labels, label_lengths = element
         mask, real_times = compute_mask(frames)
         
-        loss = jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_times, label_lengths)
+        loss = jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_times, frames, label_lengths)
         
         train_loss_sum += float(loss)
         train_steps += 1
