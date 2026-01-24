@@ -62,15 +62,12 @@ class ProcessAudioData(grain.transforms.Map):
         metadata["label"] = self.tokenizer.encode(metadata["label"])
         return metadata
 
-def round_up(n, multiple):
-    return ((n + multiple - 1) // multiple) * multiple
 
 def batch_fn(data):
     batch_size = len(data)
     max_frames = 235008
     max_label_len = 164
 
-    # Pre-allocate numpy arrays once
     padded_audios = np.zeros((batch_size, max_frames), dtype=np.float32)
     padded_labels = np.zeros((batch_size, max_label_len), dtype=np.int32)
     frames = np.zeros(batch_size, dtype=np.int32)
@@ -80,7 +77,6 @@ def batch_fn(data):
         audio = item['audio']
         label = item['label']
         
-        # Clip if audio is longer than max_frames to prevent crash
         l = min(len(audio), max_frames)
         padded_audios[i, :l] = audio[:l]
         frames[i] = l

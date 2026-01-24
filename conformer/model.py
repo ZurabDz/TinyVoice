@@ -1,24 +1,102 @@
 from flax import nnx
+import jax
 import jax.numpy as jnp
 from .mel import MelSpectrogram
 import numpy as np
 
 
-class PositionalEncoding(nnx.Module):
-    def __init__(self, d_model: int, max_len: int = 2000):
+class RelativePositionalEncoding(nnx.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
         self.d_model = d_model
-
-        pe = np.zeros((max_len, d_model))
-        position = np.arange(0, max_len)[:, np.newaxis]
+        pe = np.zeros((2 * max_len, d_model))
+        position = np.arange(0, 2 * max_len)[:, np.newaxis]
         div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
-
         pe[:, 0::2] = np.sin(position * div_term)
         pe[:, 1::2] = np.cos(position * div_term)
-
         self.pe = jnp.array(pe, dtype=jnp.float32)
 
-    def __call__(self, x: jnp.ndarray):
-        return x + self.pe[: x.shape[1], :]
+    def __call__(self, seq_len: int):
+        # returns positional embeddings for relative distances -(seq_len-1) to (seq_len-1)
+        max_len = (self.pe.shape[0]) // 2
+        return self.pe[max_len - (seq_len - 1) : max_len + seq_len]
+
+
+class RelativeMultiHeadAttention(nnx.Module):
+    def __init__(
+        self,
+        num_heads: int,
+        d_model: int,
+        qkv_features: int,
+        out_features: int,
+        dropout_rate: float,
+        rngs: nnx.Rngs,
+    ):
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.head_dim = qkv_features // num_heads
+
+        self.q_proj = nnx.Linear(d_model, qkv_features, rngs=rngs)
+        self.k_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs)
+        self.v_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs)
+        self.pos_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs)
+
+        self.out_proj = nnx.Linear(qkv_features, out_features, rngs=rngs)
+        self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
+
+        # Learned biases for relative positioning
+        self.u = nnx.Param(
+            jax.random.normal(rngs.params(), (num_heads, self.head_dim))
+        )
+        self.v = nnx.Param(
+            jax.random.normal(rngs.params(), (num_heads, self.head_dim))
+        )
+
+    def __call__(self, x, pos_emb, mask=None, training=True):
+        B, T, D = x.shape
+        H = self.num_heads
+        d = self.head_dim
+
+        q = self.q_proj(x).reshape(B, T, H, d)
+        k = self.k_proj(x).reshape(B, T, H, d)
+        v = self.v_proj(x).reshape(B, T, H, d)
+        p = self.pos_proj(pos_emb).reshape(-1, H, d)  # (2T-1, H, d)
+
+        # Term (a): content-content
+        content_q = (q + self.u).transpose(0, 2, 1, 3)  # (B, H, T, d)
+        content_scores = jnp.matmul(content_q, k.transpose(0, 2, 3, 1))
+
+        # Term (b) & (d): content-position and bias-position
+        pos_q = (q + self.v).transpose(0, 2, 1, 3)  # (B, H, T, d)
+        pos_scores = jnp.matmul(pos_q, p.transpose(1, 2, 0))  # (B, H, T, 2T-1)
+
+        # Relative shift trick to get (B, H, T, T)
+        pos_scores = self._relative_shift(pos_scores)
+
+        scores = (content_scores + pos_scores) / jnp.sqrt(d)
+
+        if mask is not None:
+            scores = jnp.where(mask, scores, -1e9)
+
+        probs = nnx.softmax(scores, axis=-1)
+        probs = self.dropout(probs, deterministic=not training)
+
+        attn_out = jnp.matmul(probs, v.transpose(0, 2, 1, 3))  # (B, H, T, d)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, -1)
+
+        return self.out_proj(attn_out)
+
+    def _relative_shift(self, x):
+        # x shape: (B, H, T, 2T-1)
+        B, H, T, W = x.shape
+        # Pad one column of zeros on the left: (B, H, T, 2T)
+        zero_pad = jnp.zeros((B, H, T, 1), dtype=x.dtype)
+        x = jnp.concatenate([zero_pad, x], axis=-1)
+        # Reshape to (B, H, 2T, T)
+        x = x.reshape(B, H, 2 * T, T)
+        # Slice and reshape to (B, H, T, 2T-1) then take first T
+        x = x[:, :, 1:, :] # (B, H, 2T-1, T)
+        x = x.reshape(B, H, T, 2 * T - 1)
+        return x[:, :, :, :T]
 
 
 class Conv2dSubSampler(nnx.Module):
@@ -120,8 +198,13 @@ class ConformerBlock(nnx.Module):
             d_model, feed_forward_expansion_factor, dropout, rngs=rngs
         )
         self.ln_before_attention = nnx.LayerNorm(d_model, rngs=rngs)
-        self.attention = nnx.MultiHeadAttention(
-            num_head, 144, qkv_features=512, out_features=144, dropout_rate=dropout, decode=False, rngs=rngs
+        self.attention = RelativeMultiHeadAttention(
+            num_head,
+            d_model,
+            qkv_features=512,
+            out_features=d_model,
+            dropout_rate=dropout,
+            rngs=rngs,
         )
         self.conv_block = ConvBlock(d_model, dropout=dropout, rngs=rngs)
         self.ff2 = FeedForwardBlock(
@@ -129,10 +212,13 @@ class ConformerBlock(nnx.Module):
         )
         self.layer_norm = nnx.LayerNorm(d_model, rngs=rngs)
 
-    def __call__(self, x, mask=None, training=True):
+    def __call__(self, x, pos_emb, mask=None, training=True):
         x = x + (self.residual_factor * self.ff1(x, training=training))
         x = x + self.attention(
-            self.ln_before_attention(x), mask=mask, deterministic=not training
+            self.ln_before_attention(x),
+            pos_emb,
+            mask=mask,
+            training=training,
         )
         x = x + self.conv_block(x, training=training)
         x = x + (self.residual_factor * self.ff2(x, training=training))
@@ -160,7 +246,7 @@ class ConformerEncoder(nnx.Module):
         self.linear_proj = nnx.Linear(
             d_model * (((d_input - 1) // 2 - 1) // 2), d_model, rngs=rngs
         )
-        self.pos_encoding = PositionalEncoding(d_model=d_model)
+        self.rel_pos_encoding = RelativePositionalEncoding(d_model=d_model)
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
         self.layers = nnx.List(
@@ -184,84 +270,13 @@ class ConformerEncoder(nnx.Module):
         x = self.conv_subsampler(x[:, :, :, None])
         x = self.linear_proj(x)
         x = x * jnp.sqrt(self.d_model)
-        x = self.pos_encoding(x)
-        x = self.dropout(x)
+
+        # Generate relative positional embeddings for the current sequence length
+        pos_emb = self.rel_pos_encoding(x.shape[1])
+        x = self.dropout(x, deterministic=not training)
 
         for layer in self.layers:
-            x = layer(x, mask, training=training)
+            x = layer(x, pos_emb, mask, training=training)
 
         return self.decoder(x)
 
-
-# class LSTMDecoder(nnx.Module):
-#     def __init__(
-#         self,
-#         d_encoder=144,
-#         d_decoder=320,
-#         num_layers=1,
-#         num_classes=48,
-#         rngs: nnx.Rngs = None,
-#     ):
-#         if rngs is None:
-#             rngs = nnx.Rngs(0)
-
-#         self.d_decoder = d_decoder
-#         self.num_layers = num_layers
-
-#         # Create LSTM cells for each layer using nnx.List
-#         lstm_cells = []
-#         for i in range(num_layers):
-#             input_size = d_encoder if i == 0 else d_decoder
-#             cell = nnx.LSTMCell(
-#                 in_features=input_size, hidden_features=d_decoder, rngs=rngs
-#             )
-#             lstm_cells.append(cell)
-
-#         self.lstm_cells = nnx.List(lstm_cells)
-
-#         # Output projection layer
-#         self.linear = nnx.Linear(d_decoder, num_classes, rngs=rngs)
-
-#     def __call__(self, x):
-#         batch_size, time_steps, _ = x.shape
-
-#         carry = []
-#         for _ in range(self.num_layers):
-#             c = jnp.zeros((batch_size, self.d_decoder))
-#             h = jnp.zeros((batch_size, self.d_decoder))
-#             carry.append((c, h))
-
-#         # Process sequence step by step
-#         outputs = []
-#         for t in range(time_steps):
-#             x_t = x[:, t, :]  # (batch_size, d_encoder)
-
-#             # Pass through each LSTM layer
-#             for layer_idx in range(self.num_layers):
-#                 c, h = carry[layer_idx]
-#                 carry_new, h_new = self.lstm_cells[layer_idx]((c, h), x_t)
-#                 carry[layer_idx] = carry_new  # carry_new is (c_new, h_new)
-#                 x_t = h_new  # Use hidden state as input to next layer
-
-#             outputs.append(x_t)
-
-#         # Stack outputs: (batch_size, time, d_decoder)
-#         lstm_out = jnp.stack(outputs, axis=1)
-
-#         # Apply linear projection: (batch_size, time, num_classes)
-#         logits = nnx.vmap(self.linear, in_axes=1, out_axes=1)(lstm_out)
-
-#         return logits
-
-
-# class ConformerModel(nnx.Module):
-#     def __init__(self, token_count, rngs: nnx.Rngs = None):
-#         if rngs is None:
-#             rngs = nnx.Rngs(0)
-#         self.encoder = ConformerEncoder(token_count=token_count, rngs=rngs)
-#         # self.decoder = LSTMDecoder(rngs=rngs)
-
-#     def __call__(self, x, mask, training):
-#         output = self.encoder(x, mask, training)
-#         # return self.decoder(output)
-#         return output
