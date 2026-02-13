@@ -1,7 +1,7 @@
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from .mel import MelSpectrogram
+from .mel import AudioToMelSpectrogram
 import numpy as np
 
 
@@ -122,6 +122,13 @@ class Conv2dSubSampler(nnx.Module):
             nnx.relu,
         )
 
+    def get_length(self, seq_len):
+        # Two layers of Conv2d with kernel_size=3, stride=2, padding="VALID"
+        # Formula: L_out = floor((L_in - K) / S) + 1
+        seq_len = (seq_len - 3) // 2 + 1
+        seq_len = (seq_len - 3) // 2 + 1
+        return jnp.maximum(seq_len, 0)
+
     def __call__(self, x):
         # B, T, D, 1(C)
         output = self.module(x)
@@ -241,7 +248,8 @@ class ConformerEncoder(nnx.Module):
         if rngs is None:
             rngs = nnx.Rngs(0)
 
-        self.mel_spectogram = MelSpectrogram(rngs=rngs)
+        self.mel_spectogram = AudioToMelSpectrogram(sample_rate=16000, n_fft=512,
+         n_window_size=320, n_window_stride=160, rng=rngs)
         self.conv_subsampler = Conv2dSubSampler(d_model=d_model, rngs=rngs)
         self.linear_proj = nnx.Linear(
             d_model * (((d_input - 1) // 2 - 1) // 2), d_model, rngs=rngs
@@ -264,9 +272,19 @@ class ConformerEncoder(nnx.Module):
         )
         self.decoder = nnx.Linear(d_model, token_count, rngs=rngs)
         self.d_model = d_model
+            
+    def compute_mask(self, lengths, max_length):
+        mask = jnp.arange(max_length)[None, :] < lengths[:, None]
+        return mask[:, None, None, :]
+
 
     def __call__(self, x, mask=None, training=True, inputs_lengths=None):
-        x = self.mel_spectogram(x, training, lengths=inputs_lengths)
+        x, seq_len = self.mel_spectogram(x, lengths=inputs_lengths)
+        x = jnp.transpose(x, (0, 2, 1))
+        
+        # Calculate subsampled length before convolution
+        seq_len = self.conv_subsampler.get_length(seq_len)
+        
         x = self.conv_subsampler(x[:, :, :, None])
         x = self.linear_proj(x)
         x = x * jnp.sqrt(self.d_model)
@@ -275,8 +293,11 @@ class ConformerEncoder(nnx.Module):
         pos_emb = self.rel_pos_encoding(x.shape[1])
         x = self.dropout(x, deterministic=not training)
 
+        if mask is None and inputs_lengths is not None:
+            mask = self.compute_mask(seq_len, x.shape[1])
+
         for layer in self.layers:
             x = layer(x, pos_emb, mask, training=training)
 
-        return self.decoder(x)
+        return self.decoder(x), seq_len
 

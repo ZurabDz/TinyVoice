@@ -125,39 +125,6 @@ def main():
         worker_buffer_size=data_config.prefetch_buffer_size
     )
     
-    
-    # We define jitted functions inside main to capture tokenizer correctly,
-    # or pass blank_id. Defining inside main is safer for now to avoid global tokenizer dependency issue.
-    
-    
-    def compute_mask(frames):
-        # MelSpectrogram: hop_length=160, win_length=400, padded=False
-        # T_mel = (T_audio - win_length) // hop_length + 1
-        # Conv2dSubSampler: two layers of kernel=3, stride=2, padding='VALID'
-        # T_out = (T_in - 3) // 2 + 1
-        # T_final = (T_out - 3) // 2 + 1
-        
-        t_mel = (frames - 400) // 160 + 1
-        t_conv1 = (t_mel - 3) // 2 + 1
-        t_final = (t_conv1 - 3) // 2 + 1
-        
-        max_frames = 235008
-        max_t_mel = (max_frames - 400) // 160 + 1
-        max_t_conv1 = (max_t_mel - 3) // 2 + 1
-        max_t_final = (max_t_conv1 - 3) // 2 + 1
-    
-        real_times = t_final
-        
-        # 1D mask: True for valid positions, False for padding
-        valid_mask = jnp.arange(max_t_final) < real_times[:, None]  # (batch, max_t_final)
-        
-        # For MultiHeadAttention: (batch, num_heads, q_len, k_len)
-        # True = attend, False = mask out
-        # We want to mask keys that are padding, so expand along query dimension
-        attention_mask = valid_mask[:, None, None, :]  # (batch, 1, 1, k_len)
-        attention_mask = jnp.broadcast_to(attention_mask, (valid_mask.shape[0], 4, max_t_final, max_t_final))
-    
-        return attention_mask, real_times
 
     @nnx.jit
     def jitted_train(model, optimizer, padded_audios, padded_labels, mask, real_times, frames, label_lengths):

@@ -1,147 +1,86 @@
+from flax import nnx
 import librosa
+import math
 import jax
 import jax.numpy as jnp
 from jax.scipy.signal import stft
-from flax import nnx
-from typing import Optional
-import jax
 
 
-class MelSpectrogram(nnx.Module):
-    def __init__(
-        self,
-        sample_rate: int = 16000,
-        n_fft: int = 400,
-        win_length: int = 400,
-        hop_length: int = 160,
-        n_mels: int = 80,
-        power: float = 2.0,
-        fmin: float = 0.0,
-        fmax: Optional[float] = None,
-        log_epsilon: float = 1e-10,
-        dtype: jnp.dtype = jnp.float32,
-        rngs: nnx.Rngs = None,
-        dither: float = 0.00001,
-        freq_mask_param: int = 27,
-        time_mask_param: int = 100,
-        n_freq_masks: int = 2,
-        n_time_masks: int = 2,
-    ):
+def normalize_batch(x, seq_len):
+    constant = 1e-5
+    batch_size, num_features, max_time = x.shape
+    
+    # time_indices [T] vs seq_len [B, 1] -> broadcasts to [B, T]
+    valid_mask = jnp.arange(max_time) < seq_len[:, None]  # [B, T]
 
+    # Expand mask for [B, C, T] -> [B, 1, T]
+    x_masked = jnp.where(valid_mask[:, None, :], x, 0.0)
+    x_mean_numerator = x_masked.sum(axis=-1)  # [B, C]
+    x_mean_denominator = seq_len  # [B]
+    x_mean = x_mean_numerator / x_mean_denominator[:, None]  # [B, C]
+
+    # Subtract 1 for Bessel's correction
+    diff_masked = jnp.where(valid_mask[:, None, :], x - x_mean[:, :, None], 0.0)
+    sum_sq = (diff_masked ** 2).sum(axis=-1)  # [B, C]
+    x_std = jnp.sqrt(sum_sq / (x_mean_denominator[:, None] - 1.0))
+
+    # Replace NaN (from seq_len=1) with 0, then add CONSTANT.
+    x_std = jnp.nan_to_num(x_std, nan=0.0)
+    x_std = x_std + constant
+
+    normalized_x = (x - x_mean[:, :, None]) / x_std[:, :, None]
+    
+    return normalized_x, x_mean, x_std  
+
+class AudioToMelSpectrogram(nnx.Module):
+    def __init__(self, sample_rate, n_window_size, n_window_stride, n_fft, rng=None):
+        self.rng = rng if rng else nnx.Rngs(0)
         self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.win_length = win_length
-        self.hop_length = hop_length
-        self.n_mels = n_mels
-        self.power = power
-        self.fmin = fmin
-        self.fmax = fmax if fmax is not None else sample_rate / 2.0
-        self.log_epsilon = log_epsilon
-        self.dtype = dtype
-        self.rngs = rngs
-        self.dither = dither
-        self.freq_mask_param = freq_mask_param
-        self.time_mask_param = time_mask_param
-        self.n_freq_masks = n_freq_masks
-        self.n_time_masks = n_time_masks
+        self.n_window_size = n_window_size
+        self.n_window_stride = n_window_stride
+        self.n_fft = n_fft if n_fft else 2 ** math.ceil(math.log2(self.n_window_size))
+        self.log = True
+        self.pad_value = 0
+        self.normalize = False
 
-        # Create and store the mel filterbank as a static parameter
-        mel_fb = librosa.filters.mel(
-            sr=self.sample_rate,
-            n_fft=self.n_fft,
-            n_mels=self.n_mels,
-            fmin=self.fmin,
-            fmax=self.fmax,
-            dtype=self.dtype,
-        )
-        self.mel_filterbank = jnp.array(mel_fb, dtype=self.dtype)
+        self.log_zero_guard_value = 2 ** -24
 
-    def __call__(self, waveforms: jnp.ndarray, training, lengths: Optional[jnp.ndarray] = None) -> jnp.ndarray:
-        if training and self.dither > 0:
-            key = self.rngs.fork().default.key.value
-            rand_waves = jax.random.normal(
-                key, shape=waveforms.shape
-            )
-            waveforms = waveforms + rand_waves * self.dither
+        self.filterbanks = librosa.filters.mel(
+            sr=16_000, n_fft=self.n_fft, n_mels=80, fmin=0, fmax=self.sample_rate / 2,
+        )[None, :]
 
-        def process_single_waveform(waveform):
-            _, _, stft_matrix = stft(
-                waveform,
-                fs=self.sample_rate,
-                nperseg=self.win_length,
-                noverlap=self.win_length - self.hop_length,
-                nfft=self.n_fft,
-                window="hann",
-                boundary="constant",
-                padded=False,
-            )
-            stft_matrix = jnp.transpose(stft_matrix)
+    def get_length(self, seq_len):
+        pad_amount = self.n_fft // 2 * 2
+        return jnp.floor_divide((seq_len + pad_amount - self.n_fft), self.n_window_stride)
 
-            power_spectrogram = jnp.abs(stft_matrix) ** self.power
+    @nnx.jit
+    def __call__(self, signal, lengths):
+        # Mask to zero values beyond seq_len
+        seq_len = self.get_length(lengths)
 
-            # (Time, Freqs) @ (Freqs, Mels) -> (Time, Mels)
-            mel_spectrogram = jnp.dot(power_spectrogram, self.mel_filterbank.T)
+        # TODO: disable autocas
+        f, t, Zxx = stft(signal, fs=self.sample_rate, nperseg=self.n_window_size, 
+            noverlap=self.n_window_size - self.n_window_stride, nfft=self.n_fft)
 
-            log_mel_spectrogram = jnp.log(mel_spectrogram + self.log_epsilon)
+        # convert complex number tensor into magnitude with guard for sqrt(if its grad?)
+        x = jnp.abs(Zxx)
+        x = jnp.pow(x, 2)
 
-            return log_mel_spectrogram
+        max_len = x.shape[-1]
 
-        def apply_spec_augment(spec, key):
-            # spec: (Time, Mels)
-            t_len, f_len = spec.shape
-            
-            for _ in range(self.n_freq_masks):
-                key, subkey = jax.random.split(key)
-                f = jax.random.randint(subkey, (), 0, self.freq_mask_param)
-                f0 = jax.random.randint(subkey, (), 0, f_len - f)
-                mask = jnp.logical_and(jnp.arange(f_len) >= f0, jnp.arange(f_len) < f0 + f)
-                spec = jnp.where(mask[None, :], 0.0, spec)
-                
-            for _ in range(self.n_time_masks):
-                key, subkey = jax.random.split(key)
-                t = jax.random.randint(subkey, (), 0, self.time_mask_param)
-                t0 = jax.random.randint(subkey, (), 0, t_len - t)
-                mask = jnp.logical_and(jnp.arange(t_len) >= t0, jnp.arange(t_len) < t0 + t)
-                spec = jnp.where(mask[:, None], 0.0, spec)
-                
-            return spec
+        # convert to human like mels
+        x = jnp.matmul(self.filterbanks, x)
 
-        # Use jax.vmap to process the batch of waveforms
-        batched_mel_spectrogram_fn = jax.vmap(process_single_waveform)
-        specs = batched_mel_spectrogram_fn(waveforms)
+        if self.log:
+            x = jnp.log(x + self.log_zero_guard_value)
+
+        if self.normalize:
+            x, _, _ = normalize_batch(x, seq_len)
+
+        # Create mask: (batch, 1, n_frames)
+        mask = jnp.arange(max_len)[None, None, :] >= seq_len[:, None, None]
+        x = jnp.where(mask, self.pad_value, x)
         
-        # Normalization
-        if lengths is not None:
-             # Calculate valid mel lengths: (L - win) // hop + 1
-            mel_lengths = (lengths - self.win_length) // self.hop_length + 1
-            # Create mask: (Batch, Time, 1) to broadcast over Mels
-            max_time = specs.shape[1]
-            mask = jnp.arange(max_time)[None, :] < mel_lengths[:, None]
-            mask = mask[:, :, None].astype(specs.dtype)
-            
-            # Compute masked mean and std
-            # Avoid division by zero by adding epsilon to count
-            count = jnp.sum(mask, axis=(1, 2), keepdims=True) + 1e-6
-            mean = jnp.sum(specs * mask, axis=(1, 2), keepdims=True) / count
-            
-            # Variance: sum((x-mean)^2 * mask) / count
-            var = jnp.sum(jnp.square(specs - mean) * mask, axis=(1, 2), keepdims=True) / count
-            std = jnp.sqrt(var + 1e-6)
-            
-            # Normalize
-            # Apply mask to output to zero out padding (good practice)
-            specs = (specs - mean) / std
-            specs = specs * mask
-            
-        else:
-            # Fallback to naive normalization if lengths not provided (though discouraged)
-            mean = jnp.mean(specs, axis=(1, 2), keepdims=True)
-            std = jnp.std(specs, axis=(1, 2), keepdims=True) + 1e-6
-            specs = (specs - mean) / std
+        return x, seq_len
+
         
-        if training:
-            key = self.rngs.fork().default.key.value
-            batch_keys = jax.random.split(key, waveforms.shape[0])
-            specs = jax.vmap(apply_spec_augment)(specs, batch_keys)
-            
-        return specs
