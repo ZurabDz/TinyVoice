@@ -46,6 +46,6 @@ class DataConfig:
     tokenizer_path: str = '/home/penguin/data/ka/packed_dataset/tokenizer.pkl'
     train_data_path: str = '/home/penguin/data/ka/packed_dataset/train.array_record'
     test_data_path: str = '/home/penguin/data/ka/packed_dataset/test.array_record'
-    batch_size: int = 12
+    batch_size: int = 16
     worker_count: int = 4
     prefetch_buffer_size: int = 2

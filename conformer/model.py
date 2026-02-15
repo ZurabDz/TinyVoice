@@ -6,14 +6,15 @@ import numpy as np
 
 
 class RelativePositionalEncoding(nnx.Module):
-    def __init__(self, d_model: int, max_len: int = 5000):
+    def __init__(self, d_model: int, max_len: int = 5000, dtype=jnp.float32):
         self.d_model = d_model
+        self.dtype = dtype
         pe = np.zeros((2 * max_len, d_model))
         position = np.arange(0, 2 * max_len)[:, np.newaxis]
         div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
         pe[:, 0::2] = np.sin(position * div_term)
         pe[:, 1::2] = np.cos(position * div_term)
-        self.pe = jnp.array(pe, dtype=jnp.float32)
+        self.pe = jnp.array(pe, dtype=dtype)
 
     def __call__(self, seq_len: int):
         # returns positional embeddings for relative distances -(seq_len-1) to (seq_len-1)
@@ -30,25 +31,27 @@ class RelativeMultiHeadAttention(nnx.Module):
         out_features: int,
         dropout_rate: float,
         rngs: nnx.Rngs,
+        dtype=jnp.float32,
     ):
         self.num_heads = num_heads
         self.d_model = d_model
         self.head_dim = qkv_features // num_heads
+        self.dtype = dtype
+        
+        self.q_proj = nnx.Linear(d_model, qkv_features, rngs=rngs, dtype=dtype)
+        self.k_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs, dtype=dtype)
+        self.v_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs, dtype=dtype)
+        self.pos_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs, dtype=dtype)
 
-        self.q_proj = nnx.Linear(d_model, qkv_features, rngs=rngs)
-        self.k_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs)
-        self.v_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs)
-        self.pos_proj = nnx.Linear(d_model, qkv_features, use_bias=False, rngs=rngs)
-
-        self.out_proj = nnx.Linear(qkv_features, out_features, rngs=rngs)
+        self.out_proj = nnx.Linear(qkv_features, out_features, rngs=rngs, dtype=dtype)
         self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
 
         # Learned biases for relative positioning
         self.u = nnx.Param(
-            jax.random.normal(rngs.params(), (num_heads, self.head_dim))
+            jax.random.normal(rngs.params(), (num_heads, self.head_dim), dtype=dtype)
         )
         self.v = nnx.Param(
-            jax.random.normal(rngs.params(), (num_heads, self.head_dim))
+            jax.random.normal(rngs.params(), (num_heads, self.head_dim), dtype=dtype)
         )
 
     def __call__(self, x, pos_emb, mask=None, training=True):
@@ -100,7 +103,7 @@ class RelativeMultiHeadAttention(nnx.Module):
 
 
 class Conv2dSubSampler(nnx.Module):
-    def __init__(self, d_model, rngs: nnx.Rngs):
+    def __init__(self, d_model, rngs: nnx.Rngs, dtype=jnp.float32):
         self.module = nnx.Sequential(
             nnx.Conv(
                 in_features=1,
@@ -109,6 +112,7 @@ class Conv2dSubSampler(nnx.Module):
                 strides=(2, 2),
                 padding="VALID",
                 rngs=rngs,
+                dtype=dtype,
             ),
             nnx.relu,
             nnx.Conv(
@@ -118,6 +122,7 @@ class Conv2dSubSampler(nnx.Module):
                 strides=(2, 2),
                 padding="VALID",
                 rngs=rngs,
+                dtype=dtype,
             ),
             nnx.relu,
         )
@@ -137,11 +142,11 @@ class Conv2dSubSampler(nnx.Module):
 
 
 class FeedForwardBlock(nnx.Module):
-    def __init__(self, d_model, expansion_factor, dropout, rngs: nnx.Rngs):
+    def __init__(self, d_model, expansion_factor, dropout, rngs: nnx.Rngs, dtype=jnp.float32):
         self.ln = nnx.LayerNorm(d_model, rngs=rngs)
-        self.lin1 = nnx.Linear(d_model, d_model * expansion_factor, rngs=rngs)
+        self.lin1 = nnx.Linear(d_model, d_model * expansion_factor, rngs=rngs, dtype=dtype)
         self.drop1 = nnx.Dropout(rate=dropout, rngs=rngs)
-        self.lin2 = nnx.Linear(d_model * expansion_factor, d_model, rngs=rngs)
+        self.lin2 = nnx.Linear(d_model * expansion_factor, d_model, rngs=rngs, dtype=dtype)
         self.drop2 = nnx.Dropout(rate=dropout, rngs=rngs)
 
     def __call__(self, x, training=True):
@@ -155,10 +160,10 @@ class FeedForwardBlock(nnx.Module):
 
 
 class ConvBlock(nnx.Module):
-    def __init__(self, d_model, dropout, rngs: nnx.Rngs):
+    def __init__(self, d_model, dropout, rngs: nnx.Rngs, dtype=jnp.float32):
         self.layer_norm = nnx.LayerNorm(d_model, rngs=rngs)
         self.conv1 = nnx.Conv(
-            in_features=d_model, out_features=d_model * 2, kernel_size=1, rngs=rngs
+            in_features=d_model, out_features=d_model * 2, kernel_size=1, rngs=rngs, dtype=dtype
         )
         self.conv2 = nnx.Conv(
             in_features=d_model,
@@ -166,10 +171,11 @@ class ConvBlock(nnx.Module):
             kernel_size=31,
             feature_group_count=d_model,
             rngs=rngs,
+            dtype=dtype,
         )
         self.bn = nnx.BatchNorm(d_model, rngs=rngs)
         self.conv3 = nnx.Conv(
-            in_features=d_model, out_features=d_model, kernel_size=1, rngs=rngs
+            in_features=d_model, out_features=d_model, kernel_size=1, rngs=rngs, dtype=dtype
         )
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
@@ -197,12 +203,13 @@ class ConformerBlock(nnx.Module):
         num_head=4,
         dropout=0.1,
         rngs: nnx.Rngs = None,
+        dtype=jnp.float32,
     ):
         if rngs is None:
             rngs = nnx.Rngs(0)
         self.residual_factor = feed_forward_residual_factor
         self.ff1 = FeedForwardBlock(
-            d_model, feed_forward_expansion_factor, dropout, rngs=rngs
+            d_model, feed_forward_expansion_factor, dropout, rngs=rngs, dtype=dtype
         )
         self.ln_before_attention = nnx.LayerNorm(d_model, rngs=rngs)
         self.attention = RelativeMultiHeadAttention(
@@ -212,10 +219,11 @@ class ConformerBlock(nnx.Module):
             out_features=d_model,
             dropout_rate=dropout,
             rngs=rngs,
+            dtype=dtype,
         )
-        self.conv_block = ConvBlock(d_model, dropout=dropout, rngs=rngs)
+        self.conv_block = ConvBlock(d_model, dropout=dropout, rngs=rngs, dtype=dtype)
         self.ff2 = FeedForwardBlock(
-            d_model, feed_forward_expansion_factor, dropout, rngs=rngs
+            d_model, feed_forward_expansion_factor, dropout, rngs=rngs, dtype=dtype
         )
         self.layer_norm = nnx.LayerNorm(d_model, rngs=rngs)
 
@@ -244,17 +252,19 @@ class ConformerEncoder(nnx.Module):
         num_head=4,
         dropout=0.1,
         rngs: nnx.Rngs = None,
+        dtype=jnp.float32,
     ):
         if rngs is None:
             rngs = nnx.Rngs(0)
 
         self.mel_spectogram = AudioToMelSpectrogram(sample_rate=16000, n_fft=512,
          n_window_size=320, n_window_stride=160, rng=rngs)
-        self.conv_subsampler = Conv2dSubSampler(d_model=d_model, rngs=rngs)
+        self.mel_spectogram.normalize = True
+        self.conv_subsampler = Conv2dSubSampler(d_model=d_model, rngs=rngs, dtype=dtype)
         self.linear_proj = nnx.Linear(
-            d_model * (((d_input - 1) // 2 - 1) // 2), d_model, rngs=rngs
+            d_model * (((d_input - 1) // 2 - 1) // 2), d_model, rngs=rngs, dtype=dtype
         )
-        self.rel_pos_encoding = RelativePositionalEncoding(d_model=d_model)
+        self.rel_pos_encoding = RelativePositionalEncoding(d_model=d_model, dtype=dtype)
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
         self.layers = nnx.List(
@@ -266,11 +276,12 @@ class ConformerEncoder(nnx.Module):
                     num_head=num_head,
                     dropout=dropout,
                     rngs=rngs,
+                    dtype=dtype,
                 )
                 for _ in range(num_layers)
             ]
         )
-        self.decoder = nnx.Linear(d_model, token_count, rngs=rngs)
+        self.decoder = nnx.Linear(d_model, token_count, rngs=rngs, dtype=dtype)
         self.d_model = d_model
             
     def compute_mask(self, lengths, max_length):
