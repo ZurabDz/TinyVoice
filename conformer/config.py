@@ -49,3 +49,16 @@ class DataConfig:
     batch_size: int = 16
     worker_count: int = 4
     prefetch_buffer_size: int = 2
+    bucket_sizes: list[tuple[int, int]] = None
+
+    def __post_init__(self):
+        if self.bucket_sizes is None:
+            self.bucket_sizes = [
+                (64000, 64),
+                (96000, 96),
+                (128000, 128),
+                (160000, 160),
+                (192000, 192),
+                (224000, 224),
+                (256000, 256),
+            ]

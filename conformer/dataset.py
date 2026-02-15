@@ -63,10 +63,24 @@ class ProcessAudioData(grain.transforms.Map):
         return metadata
 
 
-def batch_fn(data):
+def batch_fn(data, bucket_sizes=None):
     batch_size = len(data)
-    max_frames = 235008
-    max_label_len = 164
+    
+    if bucket_sizes is None:
+        # Default fallback if no buckets provided
+        max_frames = 235008
+        max_label_len = 164
+    else:
+        # Find the smallest bucket that fits all examples in the batch
+        batch_max_frames = max(len(item['audio']) for item in data)
+        batch_max_label = max(len(item['label']) for item in data)
+        
+        # Default to the largest bucket if none fit (though we should probably handle this better)
+        max_frames, max_label_len = bucket_sizes[-1]
+        for b_frames, b_label in bucket_sizes:
+            if batch_max_frames <= b_frames and batch_max_label <= b_label:
+                max_frames, max_label_len = b_frames, b_label
+                break
 
     padded_audios = np.zeros((batch_size, max_frames), dtype=np.float32)
     padded_labels = np.zeros((batch_size, max_label_len), dtype=np.int32)

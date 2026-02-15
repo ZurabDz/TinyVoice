@@ -13,6 +13,14 @@ import grain
 from conformer.dataset import batch_fn, ProcessAudioData, unpack_speech_data
 import jax
 import jax.numpy as jnp
+from pathlib import Path
+import functools
+
+# Enable JAX compilation caching
+cache_dir = Path.home() / ".cache" / "jax_compilation_cache"
+cache_dir.mkdir(parents=True, exist_ok=True)
+jax.config.update("jax_compilation_cache_dir", str(cache_dir))
+
 from tqdm.auto import tqdm
 
 data_config = DataConfig()
@@ -63,13 +71,13 @@ processed_train_dataset = (
     map_train_audio_dataset
     .shuffle(seed=42)
     .map(ProcessAudioData(tokenizer))
-    .batch(batch_size=data_config.batch_size, batch_fn=batch_fn)
+    .batch(batch_size=data_config.batch_size, batch_fn=functools.partial(batch_fn, bucket_sizes=data_config.bucket_sizes))
 )
 
 processed_test_dataset = (
     map_test_audio_dataset
     .map(ProcessAudioData(tokenizer))
-    .batch(batch_size=data_config.batch_size, batch_fn=batch_fn)
+    .batch(batch_size=data_config.batch_size, batch_fn=functools.partial(batch_fn, bucket_sizes=data_config.bucket_sizes))
 )
 
 @nnx.jit
@@ -88,13 +96,17 @@ def jitted_train(model, optimizer, padded_audios, padded_labels, frames, label_l
     optimizer.update(model=model, grads=grads)
     return loss
 
-# Warmup/Initialization
-warmup_batch = processed_train_dataset[0]
-padded_audios, frames, padded_labels, label_lengths = warmup_batch
-
-logits, real_times = model(padded_audios, mask=None, training=True, inputs_lengths=frames)
-
-jitted_train(model, optimizer, padded_audios, padded_labels, frames, label_lengths)
+# Pre-compilation (Warmup)
+print("Pre-compiling for all buckets...")
+for b_frames, b_label in tqdm(data_config.bucket_sizes, desc="Compiling buckets"):
+    # Dummy inputs for compilation
+    d_audios = jnp.zeros((data_config.batch_size, b_frames), dtype=jnp.float32)
+    d_labels = jnp.zeros((data_config.batch_size, b_label), dtype=jnp.int32)
+    d_frames = jnp.full((data_config.batch_size,), b_frames, dtype=jnp.int32)
+    d_label_lengths = jnp.full((data_config.batch_size,), b_label, dtype=jnp.int32)
+    
+    # Trigger JIT
+    jitted_train(model, optimizer, d_audios, d_labels, d_frames, d_label_lengths)
 
 # Training Loop
 epoch = 0
