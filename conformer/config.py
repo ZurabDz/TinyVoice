@@ -11,9 +11,9 @@ class TrainingConfig:
     batch_size: int = 16
     val_every_n_steps: int = 500
     lr_init_value: float = 1e-7
-    lr_peak_value: float = 5e-4
-    lr_warmup_steps: int = 1000
-    lr_decay_steps: int = 10000
+    lr_peak_value: float = 1e-3
+    lr_warmup_steps: int = 500
+    lr_decay_steps: int = 20000
     lr_end_value: float = 1e-6
 
 
@@ -31,7 +31,7 @@ class ConformerConfig:
     num_encoder_layers: int = 4
     encoder_dim: int = 256
     num_attention_heads: int = 4
-    feed_forward_expansion_factor: int = 2
+    feed_forward_expansion_factor: int = 4
     conv_expansion_factor: int = 2
     feed_forward_dropout_p: float = 0.1
     attention_dropout_p: float = 0.1

@@ -47,12 +47,15 @@ lr_schedule = optax.warmup_cosine_decay_schedule(
 
 optimizer = nnx.Optimizer(
     model,
-    optax.adamw(
-        learning_rate=lr_schedule,
-        b1=0.9,
-        b2=0.98,
-        weight_decay=1e-2,
-        mask=lambda p: jax.tree.map(lambda x: x.ndim > 1, p)
+    optax.chain(
+        optax.clip_by_global_norm(5.0),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=0.9,
+            b2=0.98,
+            weight_decay=1e-3,
+            mask=lambda p: jax.tree.map(lambda x: x.ndim > 1, p)
+        ),
     ),
     wrt=nnx.Param
 )

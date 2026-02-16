@@ -48,10 +48,10 @@ class RelativeMultiHeadAttention(nnx.Module):
 
         # Learned biases for relative positioning
         self.u = nnx.Param(
-            jax.random.normal(rngs.params(), (num_heads, self.head_dim), dtype=dtype)
+            jax.random.normal(rngs.params(), (num_heads, self.head_dim), dtype=dtype) * 0.02
         )
         self.v = nnx.Param(
-            jax.random.normal(rngs.params(), (num_heads, self.head_dim), dtype=dtype)
+            jax.random.normal(rngs.params(), (num_heads, self.head_dim), dtype=dtype) * 0.02
         )
 
     def __call__(self, x, pos_emb, mask=None, training=True):
@@ -230,7 +230,7 @@ class ConformerBlock(nnx.Module):
         self.attention = RelativeMultiHeadAttention(
             num_head,
             d_model,
-            qkv_features=512,
+            qkv_features=d_model,
             out_features=d_model,
             dropout_rate=dropout,
             rngs=rngs,
@@ -280,7 +280,7 @@ class ConformerEncoder(nnx.Module):
             rngs = nnx.Rngs(0)
 
         self.mel_spectogram = AudioToMelSpectrogram(sample_rate=16000, n_fft=512,
-         n_window_size=320, n_window_stride=160, rng=rngs)
+         n_window_size=400, n_window_stride=160, rng=rngs)
         self.mel_spectogram.normalize = True
         self.conv_subsampler = Conv2dSubSampler(d_model=d_model, rngs=rngs, dtype=dtype)
         self.linear_proj = nnx.Linear(
