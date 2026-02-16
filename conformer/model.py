@@ -6,7 +6,7 @@ import numpy as np
 
 
 class RelativePositionalEncoding(nnx.Module):
-    def __init__(self, d_model: int, max_len: int = 5000, dtype=jnp.float32):
+    def __init__(self, d_model: int, max_len: int = 500, dtype=jnp.float32):
         self.d_model = d_model
         self.dtype = dtype
         pe = np.zeros((2 * max_len, d_model))
@@ -85,6 +85,10 @@ class RelativeMultiHeadAttention(nnx.Module):
 
         attn_out = jnp.matmul(probs, v.transpose(0, 2, 1, 3))  # (B, H, T, d)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, -1)
+
+        if mask is not None:
+            q_mask = mask[:, 0, 0, :, None].astype(attn_out.dtype)
+            attn_out = attn_out * q_mask
 
         return self.out_proj(attn_out)
 
@@ -178,17 +182,28 @@ class ConvBlock(nnx.Module):
             in_features=d_model, out_features=d_model, kernel_size=1, rngs=rngs, dtype=dtype
         )
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
-
-    def __call__(self, x, training=True):
+    def __call__(self, x, mask=None, training=True):
         x = self.layer_norm(x)
 
         x = self.conv1(x)
         x = nnx.glu(x)
 
-        x = self.conv2(x)
-        x = self.bn(x, use_running_average=not training)
-        x = nnx.silu(x)
+        if mask is not None:
+            # mask is (B, 1, 1, T), x is (B, T, D)
+            m = mask[:, 0, 0, :, None].astype(x.dtype)
+            x = x * m
 
+        x = self.conv2(x)
+
+        if mask is not None:
+            x = x * m
+
+        x = self.bn(x, use_running_average=not training)
+
+        if mask is not None:
+            x = x * m
+
+        x = nnx.silu(x)
         x = self.conv3(x)
         x = self.dropout(x, deterministic=not training)
         return x
@@ -235,9 +250,16 @@ class ConformerBlock(nnx.Module):
             mask=mask,
             training=training,
         )
-        x = x + self.conv_block(x, training=training)
+        x = x + self.conv_block(x, mask=mask, training=training)
         x = x + (self.residual_factor * self.ff2(x, training=training))
-        return self.layer_norm(x)
+        x = self.layer_norm(x)
+        
+        if mask is not None:
+            # Final mask to kill any residual noise in padding
+            m = mask[:, 0, 0, :, None].astype(x.dtype)
+            x = x * m
+            
+        return x
 
 
 class ConformerEncoder(nnx.Module):
@@ -298,7 +320,7 @@ class ConformerEncoder(nnx.Module):
         
         x = self.conv_subsampler(x[:, :, :, None])
         x = self.linear_proj(x)
-        x = x * jnp.sqrt(self.d_model)
+        x = x * jnp.sqrt(self.d_model) # Standard scaling for Conformer/Transformer
 
         # Generate relative positional embeddings for the current sequence length
         pos_emb = self.rel_pos_encoding(x.shape[1])

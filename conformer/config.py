@@ -7,7 +7,7 @@ class TrainingConfig:
     learning_rate: float = 5e-4
     beta1: float = 0.9
     beta2: float = 0.98
-    num_epochs: int = 1
+    num_epochs: int = 4
     batch_size: int = 16
     val_every_n_steps: int = 500
     lr_init_value: float = 1e-7
@@ -29,8 +29,8 @@ class FeaturizerConfig:
 class ConformerConfig:
     input_dim: int = 80
     num_encoder_layers: int = 4
-    encoder_dim: int = 128
-    num_attention_heads: int = 2
+    encoder_dim: int = 256
+    num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 2
     conv_expansion_factor: int = 2
     feed_forward_dropout_p: float = 0.1
@@ -47,8 +47,8 @@ class DataConfig:
     train_data_path: str = '/home/penguin/data/ka/packed_dataset/train.array_record'
     test_data_path: str = '/home/penguin/data/ka/packed_dataset/test.array_record'
     batch_size: int = 16
-    worker_count: int = 4
-    prefetch_buffer_size: int = 2
+    worker_count: int = 8
+    prefetch_buffer_size: int = 16
     bucket_sizes: list[tuple[int, int]] = None
 
     def __post_init__(self):

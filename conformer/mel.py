@@ -46,14 +46,13 @@ class AudioToMelSpectrogram(nnx.Module):
         self.log_zero_guard_value = 2 ** -24
 
         self.filterbanks = librosa.filters.mel(
-            sr=16_000, n_fft=self.n_fft, n_mels=80, fmin=0, fmax=self.sample_rate / 2,
+            sr=self.sample_rate, n_fft=self.n_fft, n_mels=80, fmin=0, fmax=self.sample_rate / 2,
         )[None, :]
 
     def get_length(self, seq_len):
         pad_amount = self.n_fft // 2 * 2
         return jnp.floor_divide((seq_len + pad_amount - self.n_fft), self.n_window_stride)
 
-    @nnx.jit
     def __call__(self, signal, lengths):
         # Mask to zero values beyond seq_len
         seq_len = self.get_length(lengths)

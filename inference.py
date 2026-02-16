@@ -7,7 +7,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 from conformer.tokenizer import Tokenizer
 from pathlib import Path
-from conformer.config import DataConfig, TrainingConfig
+from conformer.config import DataConfig, TrainingConfig, ConformerConfig
 from conformer.model import ConformerEncoder
 from flax import nnx
 import optax
@@ -26,9 +26,14 @@ def main():
     # 1. Load Tokenizer
     tokenizer = Tokenizer.load_tokenizer(Path(data_config.tokenizer_path))
     
-    # 2. Initialize Model
-    # Re-init model with RNGs to ensure variables are created
-    model = ConformerEncoder(token_count=len(tokenizer.id_to_char), dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
+    conformer_config = ConformerConfig()
+    model = ConformerEncoder(
+        token_count=len(tokenizer.id_to_char), 
+        num_layers=conformer_config.num_encoder_layers,
+        d_model=conformer_config.encoder_dim,
+        dtype=jnp.bfloat16, 
+        rngs=nnx.Rngs(0)
+    )
     
     # 3. Setup Checkpoint Manager
     checkpoint_dir = os.path.abspath("./checkpoints")
@@ -48,22 +53,16 @@ def main():
     print(f"Restoring checkpoint from step {latest_step}...")
     
     # 4. Restore Checkpoint
-    # We need a target structure. We can instantiate a dummy optimizer or just dict.
-    # The saved checkpoint is {'model': ..., 'optimizer': ...}
-    # We want to restore 'model'.
-    
-    # To properly restore, we should match the structure.
-    # Let's create a dummy optimizer to match the saved structure exactly.
-    # This avoids issues with partial restoration if not fully supported/configured.
+    # For GPU -> CPU restoration, we need StandardRestore with a target structure
+    # and Optax/NNX states can be restored as plain dicts.
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=1e-4, warmup_steps=100, decay_steps=1000, end_value=0.0
     )
-
     optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=lr_schedule), wrt=nnx.Param)
     
     target = {'model': nnx.state(model), 'optimizer': nnx.state(optimizer)}
     
-    restored = mngr.restore(latest_step, args=ocp.args.StandardRestore(target))
+    restored = mngr.restore(latest_step, args=ocp.args.StandardRestore(item=target))
     
     # Update model with restored state
     nnx.update(model, restored['model'])
@@ -98,12 +97,12 @@ def main():
             prev = _id
         return "".join(res)
 
-    print("\nStarting Inference on Test Set (Top 5 samples)...")
+    print("\nStarting Inference on Test Set (Top 10 samples)...")
     
     count = 0 
     for batch in iterator:
-        if count >= 5:
-            break
+        # if count >= 10:
+        #     break
             
         padded_audios, frames, padded_labels, label_lengths = batch
         
@@ -118,7 +117,7 @@ def main():
         gt_tokens = padded_labels[0][:int(label_lengths[0])] # Slice to actual length
         
         pred_text = ctc_decode(pred_tokens, tokenizer)
-        gt_text = "".join([tokenizer.id_to_char.get(int(t), "") for t in gt_tokens if int(t) > 1]) # Skip padding/blank
+        gt_text = "".join([tokenizer.id_to_char.get(int(t), "") for t in gt_tokens if int(t) != tokenizer.blank_id]) # Skip blank/padding
         
         print(f"\nSample {count+1}:")
         print(f"Ground Truth: {gt_text}")
