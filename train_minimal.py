@@ -34,7 +34,11 @@ model = ConformerEncoder(
     token_count=len(tokenizer.id_to_char), 
     num_layers=conformer_config.num_encoder_layers,
     d_model=conformer_config.encoder_dim,
-    dtype=jnp.bfloat16
+    num_head=conformer_config.num_attention_heads,
+    dropout=conformer_config.feed_forward_dropout_p,
+    feed_forward_expansion_factor=conformer_config.feed_forward_expansion_factor,
+    dtype=jnp.bfloat16,
+    rngs=nnx.Rngs(0)
 )
 
 lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -45,6 +49,10 @@ lr_schedule = optax.warmup_cosine_decay_schedule(
     end_value=train_config.lr_end_value
 )
 
+# Weight decay mask: apply weight decay only to weights (ndim > 1), not biases (ndim == 1)
+def weight_decay_mask(params):
+    return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
+
 optimizer = nnx.Optimizer(
     model,
     optax.chain(
@@ -54,7 +62,7 @@ optimizer = nnx.Optimizer(
             b1=0.9,
             b2=0.98,
             weight_decay=1e-3,
-            mask=lambda p: jax.tree.map(lambda x: x.ndim > 1, p)
+            mask=weight_decay_mask
         ),
     ),
     wrt=nnx.Param
@@ -111,6 +119,7 @@ def train_step(model_graphdef, model_state, optimizer_graphdef, optimizer_state,
         label_paddings = (jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]).astype(jnp.float32)
         
         loss = optax.ctc_loss(logits.astype(jnp.float32), logit_paddings, padded_labels, label_paddings, blank_id=tokenizer.blank_id).mean()
+        
         return loss
     
     loss, grads = nnx.value_and_grad(loss_fn)(model)
@@ -120,6 +129,20 @@ def train_step(model_graphdef, model_state, optimizer_graphdef, optimizer_state,
     _, new_optimizer_state = nnx.split(optimizer)
     
     return loss, new_model_state, new_optimizer_state
+
+@jax.jit(static_argnums=(0,))
+def eval_step(model_graphdef, model_state, padded_audios, padded_labels, frames, label_lengths):
+    """Evaluation step"""
+    model = nnx.merge(model_graphdef, model_state)
+    
+    logits, real_times = model(padded_audios, training=False, inputs_lengths=frames)
+    
+    logit_paddings = (jnp.arange(logits.shape[1]) >= real_times[:, None]).astype(jnp.float32)
+    label_paddings = (jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]).astype(jnp.float32)
+    
+    loss = optax.ctc_loss(logits.astype(jnp.float32), logit_paddings, padded_labels, label_paddings, blank_id=tokenizer.blank_id).mean()
+    
+    return loss
 
 # Initial Split
 model_graphdef, model_state = nnx.split(model)
@@ -157,18 +180,44 @@ for epoch in range(train_config.num_epochs):
         #     jax.profiler.start_trace("./logs")
             
         padded_audios, frames, padded_labels, label_lengths = element
-        loss, model_state, optimizer_state = train_step(
-            model_graphdef, model_state, 
-            optimizer_graphdef, optimizer_state, 
-            padded_audios, padded_labels, frames, label_lengths
-        )
+        # Convert numpy arrays to JAX arrays
+        padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
+        padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
+        frames = jnp.array(frames, dtype=jnp.int32)
+        label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
+        
+        # Basic validation
+        if padded_audios.shape[0] == 0:
+            print(f"Warning: Empty batch at step {global_step}, skipping...")
+            continue
+        
+        try:
+            loss, model_state, optimizer_state = train_step(
+                model_graphdef, model_state, 
+                optimizer_graphdef, optimizer_state, 
+                padded_audios, padded_labels, frames, label_lengths
+            )
+            
+            # Validation checks outside JIT
+            loss_val = float(loss)
+            if not jnp.isfinite(loss):
+                print(f"Warning: Non-finite loss {loss_val} at step {global_step}")
+            if loss_val > 1000:
+                print(f"Warning: Very large loss {loss_val} at step {global_step}")
+                
+        except Exception as e:
+            print(f"Error at step {global_step}: {e}")
+            print(f"  Batch shape: audio={padded_audios.shape}, labels={padded_labels.shape}")
+            print(f"  Frames: {frames}, Label lengths: {label_lengths}")
+            raise
         
         # 2. Stop profiling at global_step 20
         # if global_step == 20:
         #     print("Stopping JAX trace...")
         #     jax.profiler.stop_trace()
             
-        train_loss_sum += loss # Keep as JAX array for now to avoid sync
+        # Convert loss to float to avoid accumulating JAX arrays
+        train_loss_sum += float(loss)
         train_steps += 1
         global_step += 1
         
@@ -180,5 +229,24 @@ for epoch in range(train_config.num_epochs):
         
         # Update tqdm only every 10 steps to reduce CPU-GPU sync
         if global_step % 10 == 0:
-            avg_train_loss = float(train_loss_sum) / train_steps
-            pbar.set_postfix({"train_loss": f"{avg_train_loss:.2f}", "step": global_step})
+            avg_train_loss = train_loss_sum / train_steps
+            pbar.set_postfix({"train_loss": f"{avg_train_loss:.4f}", "step": global_step})
+    
+    # Validation after each epoch
+    print(f"\nRunning validation after epoch {epoch+1}...")
+    val_loss_sum = 0.0
+    val_steps = 0
+    for element in tqdm(processed_test_dataset, desc="Validation"):
+        padded_audios, frames, padded_labels, label_lengths = element
+        # Convert numpy arrays to JAX arrays
+        padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
+        padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
+        frames = jnp.array(frames, dtype=jnp.int32)
+        label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
+        
+        val_loss = eval_step(model_graphdef, model_state, padded_audios, padded_labels, frames, label_lengths)
+        val_loss_sum += float(val_loss)
+        val_steps += 1
+    
+    avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else 0.0
+    print(f"Epoch {epoch+1} - Train Loss: {train_loss_sum/train_steps:.4f}, Val Loss: {avg_val_loss:.4f}\n")

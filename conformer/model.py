@@ -19,7 +19,35 @@ class RelativePositionalEncoding(nnx.Module):
     def __call__(self, seq_len: int):
         # returns positional embeddings for relative distances -(seq_len-1) to (seq_len-1)
         max_len = (self.pe.shape[0]) // 2
-        return self.pe[max_len - (seq_len - 1) : max_len + seq_len]
+        
+        # Handle edge case: if seq_len is 0 or negative, return empty
+        if seq_len <= 0:
+            return jnp.zeros((0, self.d_model), dtype=self.dtype)
+        
+        # Ensure we don't go out of bounds
+        start_idx = max(0, max_len - (seq_len - 1))
+        end_idx = min(self.pe.shape[0], max_len + seq_len)
+        pe_slice = self.pe[start_idx:end_idx]
+        
+        # If we had to clip, pad with zeros
+        if start_idx > max_len - (seq_len - 1):
+            pad_before = jnp.zeros((start_idx - (max_len - (seq_len - 1)), self.d_model), dtype=self.dtype)
+            pe_slice = jnp.concatenate([pad_before, pe_slice], axis=0)
+        if end_idx < max_len + seq_len:
+            pad_after = jnp.zeros((max_len + seq_len - end_idx, self.d_model), dtype=self.dtype)
+            pe_slice = jnp.concatenate([pe_slice, pad_after], axis=0)
+        
+        # Final check: ensure output has correct length
+        expected_len = 2 * seq_len - 1
+        if pe_slice.shape[0] != expected_len:
+            # This shouldn't happen, but handle it gracefully
+            if pe_slice.shape[0] < expected_len:
+                pad_needed = expected_len - pe_slice.shape[0]
+                pe_slice = jnp.concatenate([pe_slice, jnp.zeros((pad_needed, self.d_model), dtype=self.dtype)], axis=0)
+            else:
+                pe_slice = pe_slice[:expected_len]
+        
+        return pe_slice
 
 
 class RelativeMultiHeadAttention(nnx.Module):
@@ -78,7 +106,12 @@ class RelativeMultiHeadAttention(nnx.Module):
         scores = (content_scores + pos_scores) / jnp.sqrt(d)
 
         if mask is not None:
-            scores = jnp.where(mask, scores, -1e9)
+            # mask is (B, 1, 1, T), expand to (B, 1, T, T) for attention masking
+            # Mask out positions where either query or key is padding
+            mask_query = mask[:, 0, 0, :, None]  # (B, T, 1)
+            mask_key = mask[:, 0, 0, None, :]  # (B, 1, T)
+            mask_expanded = (mask_query & mask_key)[:, None, :, :]  # (B, 1, T, T)
+            scores = jnp.where(mask_expanded, scores, -1e9)
 
         probs = nnx.softmax(scores, axis=-1)
         probs = self.dropout(probs, deterministic=not training)
@@ -177,7 +210,7 @@ class ConvBlock(nnx.Module):
             rngs=rngs,
             dtype=dtype,
         )
-        self.bn = nnx.BatchNorm(d_model, rngs=rngs)
+        self.ln_after_conv2 = nnx.LayerNorm(d_model, rngs=rngs)
         self.conv3 = nnx.Conv(
             in_features=d_model, out_features=d_model, kernel_size=1, rngs=rngs, dtype=dtype
         )
@@ -198,7 +231,7 @@ class ConvBlock(nnx.Module):
         if mask is not None:
             x = x * m
 
-        x = self.bn(x, use_running_average=not training)
+        x = self.ln_after_conv2(x)
 
         if mask is not None:
             x = x * m
@@ -283,8 +316,11 @@ class ConformerEncoder(nnx.Module):
          n_window_size=400, n_window_stride=160, rng=rngs)
         self.mel_spectogram.normalize = True
         self.conv_subsampler = Conv2dSubSampler(d_model=d_model, rngs=rngs, dtype=dtype)
+        # Calculate frequency dimension after two conv layers: (d_input - 3) // 2 + 1, then ((freq_dim - 3) // 2 + 1)
+        freq_dim_after_conv1 = (d_input - 3) // 2 + 1
+        freq_dim_after_conv2 = (freq_dim_after_conv1 - 3) // 2 + 1
         self.linear_proj = nnx.Linear(
-            d_model * (((d_input - 1) // 2 - 1) // 2), d_model, rngs=rngs, dtype=dtype
+            d_model * freq_dim_after_conv2, d_model, rngs=rngs, dtype=dtype
         )
         self.rel_pos_encoding = RelativePositionalEncoding(d_model=d_model, dtype=dtype)
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
