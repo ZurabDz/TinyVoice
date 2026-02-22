@@ -1,18 +1,21 @@
 import os
-from jiwer import wer, cer
-# os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["JAX_PLATFORMS"] = "cpu"
 # os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".95"
 # os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
 from conformer.tokenizer import Tokenizer
 from pathlib import Path
-from conformer.config import DataConfig, TrainingConfig, ConformerConfig
+from conformer.config import (
+    DataConfig,
+    ConformerConfig,
+    FeaturizerConfig,
+)
 from conformer.model import ConformerEncoder
 from flax import nnx
 import optax
 import grain
-from conformer.dataset import batch_fn, ProcessAudioData, unpack_speech_data
+from conformer.dataset import batch_fn, ProcessAudioData
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
@@ -27,11 +30,17 @@ def main():
     # 1. Load Tokenizer
     tokenizer = Tokenizer.load_tokenizer(Path(data_config.tokenizer_path))
 
+    featurizer_config = FeaturizerConfig()
     conformer_config = ConformerConfig()
     model = ConformerEncoder(
         token_count=len(tokenizer.id_to_char),
         num_layers=conformer_config.num_encoder_layers,
         d_model=conformer_config.encoder_dim,
+        d_input=featurizer_config.n_mels,
+        sample_rate=featurizer_config.sampling_rate,
+        n_fft=featurizer_config.n_fft,
+        n_window_size=featurizer_config.win_length,
+        n_window_stride=featurizer_config.hop_length,
         dtype=jnp.bfloat16,
         rngs=nnx.Rngs(0),
     )
@@ -61,6 +70,10 @@ def main():
         end_value=0.0,
     )
 
+    # Weight decay mask: apply weight decay only to weights (ndim > 1), not biases (ndim == 1)
+    def weight_decay_mask(params):
+        return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
+
     optimizer = nnx.Optimizer(
         model,
         optax.chain(
@@ -70,7 +83,7 @@ def main():
                 b1=0.9,
                 b2=0.98,
                 weight_decay=1e-3,
-                mask=0.1,
+                mask=weight_decay_mask,
             ),
         ),
         wrt=nnx.Param,
@@ -131,8 +144,9 @@ def main():
 
     count = 0
     from tqdm.auto import tqdm
+
     for batch in tqdm(iterator, desc="Inference"):
-        if count >= 500:
+        if count >= 10:
             break
 
         padded_audios, frames, padded_labels, label_lengths = batch
@@ -142,11 +156,12 @@ def main():
             padded_audios, training=False, inputs_lengths=frames
         )
 
-        # Greedy decoding: argmax
-        predicted_ids = jnp.argmax(logits, axis=-1)
+        # Greedy decoding: argmax with sequence length masking
+        seq_len = int(output_seq_len[0])
+        predicted_ids = jnp.argmax(logits[0, :seq_len], axis=-1)
 
         # Batch size is 1, take first element
-        pred_tokens = predicted_ids[0]
+        pred_tokens = predicted_ids
         gt_tokens = padded_labels[0][: int(label_lengths[0])]  # Slice to actual length
 
         pred_text = ctc_decode(pred_tokens, tokenizer)
@@ -158,19 +173,20 @@ def main():
             ]
         )  # Skip blank/padding
 
-        # print(f"\nSample {count + 1}:")
-        # print(f"Ground Truth: {gt_text}")
-        # print(f"Prediction:   {pred_text}")
+        print(f"\nSample {count + 1}:")
+        print(f"Ground Truth: {gt_text}")
+        print(f"Prediction:   {pred_text}")
 
         ground_truth_texts.append(only_georgian_chars(gt_text))
         predicted_texts.append(only_georgian_chars(pred_text))
 
         count += 1
 
-    print("WER: ", wer(ground_truth_texts, predicted_texts))
-    print("CER: ", cer(ground_truth_texts, predicted_texts))
-    print(ground_truth_texts)
-    print(predicted_texts)
+    # print("WER: ", wer(ground_truth_texts, predicted_texts))
+    # print("CER: ", cer(ground_truth_texts, predicted_texts))
+    # print(ground_truth_texts)
+    # print(predicted_texts)
+
 
 if __name__ == "__main__":
     main()
