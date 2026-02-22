@@ -88,7 +88,15 @@ def spec_augment(
 
 
 class AudioToMelSpectrogram(nnx.Module):
-    def __init__(self, sample_rate, n_window_size, n_window_stride, n_fft, rng=None):
+    def __init__(
+        self,
+        sample_rate,
+        n_window_size,
+        n_window_stride,
+        n_fft,
+        n_mels=80,
+        rng=None,
+    ):
         self.rngs = rng if rng else nnx.Rngs(0)
         self.sample_rate = sample_rate
         self.n_window_size = n_window_size
@@ -104,7 +112,7 @@ class AudioToMelSpectrogram(nnx.Module):
         self.filterbanks = librosa.filters.mel(
             sr=self.sample_rate,
             n_fft=self.n_fft,
-            n_mels=80,
+            n_mels=n_mels,
             fmin=0,
             fmax=self.sample_rate / 2,
         )[None, :]

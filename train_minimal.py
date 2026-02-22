@@ -1,9 +1,15 @@
 import os
 
-# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
-os.environ["XLA_FLAGS"] = "--xla_gpu_enable_command_buffer="
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_enable_command_buffer= "
+    "--xla_gpu_strict_conv_algorithm_picker=false "
+    "--xla_gpu_triton_gemm_any=true "
+    "--xla_gpu_enable_latency_hiding_scheduler=true "
+    "--xla_gpu_enable_highest_priority_async_stream=true "
+)
 
 from conformer.tokenizer import Tokenizer, HuggingFaceBPETokenizer
 from conformer.config import (

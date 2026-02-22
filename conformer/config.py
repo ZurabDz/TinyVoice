@@ -24,12 +24,12 @@ class FeaturizerConfig:
     n_fft: int = 512
     win_length: int = 400
     hop_length: int = 160
-    n_mels: int = 80
+    n_mels: int = 128
 
 
 @dataclass
 class ConformerConfig:
-    input_dim: int = 80
+    input_dim: int = 128
     num_encoder_layers: int = 4
     encoder_dim: int = 256
     num_attention_heads: int = 4
@@ -46,10 +46,10 @@ class ConformerConfig:
 @dataclass
 class DataConfig:
     checkpoints_path: str = "/home/penguin/data/ka/checkpoints"
-    tokenizer_path: str = "/home/penguin/data/ka/packed_dataset/tokenizer.pkl"
+    tokenizer_path: str = "/home/penguin/data/ka/packed_dataset/tokenizer.json"
     train_data_path: str = "/home/penguin/data/ka/packed_dataset/train.array_record"
     test_data_path: str = "/home/penguin/data/ka/packed_dataset/test.array_record"
-    batch_size: int = 16
+    batch_size: int = 12
     worker_count: int = 8
     prefetch_buffer_size: int = 16
     bucket_sizes: Optional[list[tuple[int, int]]] = None

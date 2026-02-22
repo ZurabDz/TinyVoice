@@ -349,6 +349,7 @@ class ConformerEncoder(nnx.Module):
             n_fft=n_fft,
             n_window_size=n_window_size,
             n_window_stride=n_window_stride,
+            n_mels=d_input,
             rng=rngs,
         )
         self.mel_spectogram.normalize = True
