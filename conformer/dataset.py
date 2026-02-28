@@ -1,4 +1,4 @@
-from array_record.python import array_record_module
+from array_record.python import array_record_module  # ty:ignore[unresolved-import]
 from tqdm import tqdm
 import pickle
 import struct
@@ -50,8 +50,6 @@ class ProcessAudioData(grain.transforms.Map):
 
     def map(self, element: bytes):
         metadata, audio_bytes = unpack_speech_data(element)
-        # data = BytesIO(audio_bytes)
-        # sig, sr = librosa.load(data, sr=None)
         with io.BytesIO(audio_bytes) as fh:
             sig, sr = sf.read(fh, dtype="float32")
         metadata["audio"] = sig

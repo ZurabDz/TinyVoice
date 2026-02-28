@@ -1,6 +1,6 @@
 import os
 
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 os.environ["XLA_FLAGS"] = (
@@ -205,7 +205,12 @@ def train_step(
 
 @jax.jit(static_argnums=(0,))
 def eval_step(
-    model_graphdef, model_state, padded_audios, padded_labels, frames, label_lengths
+    model_graphdef: nnx.GraphDef,
+    model_state: nnx.State,
+    padded_audios: jnp.ndarray,
+    padded_labels: jnp.ndarray,
+    frames: jnp.ndarray,
+    label_lengths: jnp.ndarray,
 ):
     """Evaluation step"""
     model = nnx.merge(model_graphdef, model_state)
