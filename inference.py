@@ -1,17 +1,18 @@
 import os
+
 os.environ["JAX_PLATFORMS"] = "cpu"
 # os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".95"
 # os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
-from conformer.tokenizer import Tokenizer
+from conformer.tokenizer import Tokenizer, HuggingFaceBPETokenizer
 from pathlib import Path
 from conformer.config import (
     DataConfig,
     ConformerConfig,
     FeaturizerConfig,
 )
-from conformer.model import ConformerEncoder
+from conformer.model import ZipformerEncoder
 from flax import nnx
 import optax
 import grain
@@ -28,14 +29,27 @@ def main():
     print(f"Using device: {jax.devices()[0]}")
 
     # 1. Load Tokenizer
-    tokenizer = Tokenizer.load_tokenizer(Path(data_config.tokenizer_path))
+    tokenizer_path = Path(data_config.tokenizer_path)
+    if tokenizer_path.suffix == ".json":
+        tokenizer = HuggingFaceBPETokenizer.from_pretrained(tokenizer_path.parent)
+    else:
+        tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
 
     featurizer_config = FeaturizerConfig()
     conformer_config = ConformerConfig()
-    model = ConformerEncoder(
-        token_count=len(tokenizer.id_to_char),
+    token_count = (
+        tokenizer.vocab_size
+        if hasattr(tokenizer, "vocab_size")
+        else len(tokenizer.id_to_char)
+    )
+
+    model = ZipformerEncoder(
+        token_count=token_count,
         num_layers=conformer_config.num_encoder_layers,
         d_model=conformer_config.encoder_dim,
+        num_head=conformer_config.num_attention_heads,
+        dropout=conformer_config.feed_forward_dropout_p,
+        feed_forward_expansion_factor=conformer_config.feed_forward_expansion_factor,
         d_input=featurizer_config.n_mels,
         sample_rate=featurizer_config.sampling_rate,
         n_fft=featurizer_config.n_fft,
@@ -124,18 +138,37 @@ def main():
     iterator = iter(processed_test_dataset)
 
     def only_georgian_chars(text):
-        return "".join([c for c in text if c in tokenizer.id_to_char.values()])
+        # Keep Georgian characters, spaces, and common punctuation
+        return text
 
     def ctc_decode(ids, tokenizer):
-        res = []
+        """CTC greedy decode: collapse repeated tokens and remove blanks."""
+        collapsed_ids = []
         prev = -1
         for _id in ids:
             _id = int(_id)
             if _id != prev:
-                if _id != tokenizer.blank_id and _id != tokenizer.padding_id:
-                    res.append(tokenizer.id_to_char.get(_id, f"[{_id}]"))
+                if _id != tokenizer.blank_id and _id != getattr(
+                    tokenizer, "padding_id", -1
+                ):
+                    collapsed_ids.append(_id)
             prev = _id
-        return "".join(res)
+
+        # Use tokenizer's decode method (works for both char-level and BPE)
+        if hasattr(tokenizer, "id_to_char"):
+            return "".join(
+                [tokenizer.id_to_char.get(_id, f"[{_id}]") for _id in collapsed_ids]
+            )
+        else:
+            return tokenizer.decode(collapsed_ids).replace("\ufffd", "")
+
+    def decode_gt(tokens, tokenizer):
+        """Decode ground truth token IDs."""
+        ids = [int(t) for t in tokens if int(t) != tokenizer.blank_id]
+        if hasattr(tokenizer, "id_to_char"):
+            return "".join([tokenizer.id_to_char.get(_id, "") for _id in ids])
+        else:
+            return tokenizer.decode(ids)
 
     print("\nStarting Inference on Test Set (Top 10 samples)...")
 
@@ -145,42 +178,39 @@ def main():
     count = 0
     from tqdm.auto import tqdm
 
-    for batch in tqdm(iterator, desc="Inference"):
-        if count >= 10:
-            break
+    with open("transcribe.txt", "w", encoding="utf-8") as f:
+        for batch in tqdm(iterator, desc="Inference"):
+            # if count >= 10:
+            #     break
 
-        padded_audios, frames, padded_labels, label_lengths = batch
+            padded_audios, frames, padded_labels, label_lengths = batch
 
-        # Forward pass
-        logits, output_seq_len = model(
-            padded_audios, training=False, inputs_lengths=frames
-        )
+            # Forward pass
+            logits, output_seq_len = model(
+                padded_audios, training=False, inputs_lengths=frames
+            )
 
-        # Greedy decoding: argmax with sequence length masking
-        seq_len = int(output_seq_len[0])
-        predicted_ids = jnp.argmax(logits[0, :seq_len], axis=-1)
+            # Greedy decoding: argmax with sequence length masking
+            seq_len = int(output_seq_len[0])
+            predicted_ids = jnp.argmax(logits[0, :seq_len], axis=-1)
 
-        # Batch size is 1, take first element
-        pred_tokens = predicted_ids
-        gt_tokens = padded_labels[0][: int(label_lengths[0])]  # Slice to actual length
+            # Batch size is 1, take first element
+            pred_tokens = predicted_ids
+            gt_tokens = padded_labels[0][
+                : int(label_lengths[0])
+            ]  # Slice to actual length
 
-        pred_text = ctc_decode(pred_tokens, tokenizer)
-        gt_text = "".join(
-            [
-                tokenizer.id_to_char.get(int(t), "")
-                for t in gt_tokens
-                if int(t) != tokenizer.blank_id
-            ]
-        )  # Skip blank/padding
+            pred_text = ctc_decode(pred_tokens, tokenizer)
+            gt_text = decode_gt(gt_tokens, tokenizer)
 
-        print(f"\nSample {count + 1}:")
-        print(f"Ground Truth: {gt_text}")
-        print(f"Prediction:   {pred_text}")
+            f.write(f"\nSample {count + 1}:\n")
+            f.write(f"Ground Truth: {gt_text}\n")
+            f.write(f"Prediction:   {pred_text}\n")
 
-        ground_truth_texts.append(only_georgian_chars(gt_text))
-        predicted_texts.append(only_georgian_chars(pred_text))
+            ground_truth_texts.append(only_georgian_chars(gt_text))
+            predicted_texts.append(only_georgian_chars(pred_text))
 
-        count += 1
+            count += 1
 
     # print("WER: ", wer(ground_truth_texts, predicted_texts))
     # print("CER: ", cer(ground_truth_texts, predicted_texts))

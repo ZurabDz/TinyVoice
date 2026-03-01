@@ -18,7 +18,7 @@ from conformer.config import (
     ConformerConfig,
     FeaturizerConfig,
 )
-from conformer.model import ConformerEncoder
+from conformer.model import ZipformerEncoder
 from flax import nnx
 import optax
 import grain
@@ -53,7 +53,7 @@ token_count = (
     else len(tokenizer.id_to_char)
 )
 
-model = ConformerEncoder(
+model = ZipformerEncoder(
     token_count=token_count,
     num_layers=conformer_config.num_encoder_layers,
     d_model=conformer_config.encoder_dim,
