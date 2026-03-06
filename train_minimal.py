@@ -249,28 +249,38 @@ optimizer_graphdef, optimizer_state = nnx.split(optimizer)
 # mngr.wait_until_finished()
 
 # Pre-compilation (Warmup)
-# Use jax.jit(...).lower().compile() to trigger AOT compilation without
-# executing the function, so the optimizer state and model weights stay clean.
+# Use .lower().compile() to trigger AOT compilation for each bucket shape
+# WITHOUT executing the function or touching real weights.
+#
+# Key points:
+#  - train_step is already @jax.jit decorated, so we call it directly.
+#  - We use jax.eval_shape() to get abstract ShapedArray versions of the
+#    real states so that donate_argnums never consumes/zeroes the real buffers.
 print("Pre-compiling for all buckets...")
+
+# Build abstract (shape-only) versions of the static pytrees once.
+abstract_model_state = jax.eval_shape(lambda: model_state)
+abstract_optimizer_state = jax.eval_shape(lambda: optimizer_state)
+
 for b_frames, b_label in tqdm(data_config.bucket_sizes, desc="Compiling buckets"):
-    # Dummy inputs for shape/dtype inference only
+    # Dummy inputs — only shape & dtype matter, values are never used.
     d_audios = jnp.zeros((data_config.batch_size, b_frames), dtype=jnp.float32)
     d_labels = jnp.zeros((data_config.batch_size, b_label), dtype=jnp.int32)
     d_frames = jnp.full((data_config.batch_size,), b_frames, dtype=jnp.int32)
     d_label_lengths = jnp.full((data_config.batch_size,), b_label, dtype=jnp.int32)
 
-    # Trigger AOT compilation without running the function
-    jax.jit(train_step, static_argnums=(0, 2), donate_argnums=(1, 3)).lower(
+    # Lower using abstract states — real buffers are never donated.
+    train_step.lower(
         model_graphdef,
-        model_state,
+        abstract_model_state,
         optimizer_graphdef,
-        optimizer_state,
+        abstract_optimizer_state,
         d_audios,
         d_labels,
         d_frames,
         d_label_lengths,
     ).compile()
-    print(f"compiling {b_frames} {b_label} is done")
+    print(f"Compiled bucket: audio_frames={b_frames}, label_len={b_label}")
 
 # Training Loop
 global_step = 0

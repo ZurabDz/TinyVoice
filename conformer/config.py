@@ -8,7 +8,7 @@ class TrainingConfig:
     learning_rate: float = 5e-4
     beta1: float = 0.9
     beta2: float = 0.98
-    num_epochs: int = 10
+    num_epochs: int = 100
     batch_size: int = 16
     val_every_n_steps: int = 500
     lr_init_value: float = 1e-7
@@ -46,7 +46,7 @@ class ConformerConfig:
 @dataclass
 class DataConfig:
     checkpoints_path: str = "/home/penguin/data/ka/checkpoints"
-    tokenizer_path: str = "/home/penguin/data/ka/packed_dataset/tokenizer.json"
+    tokenizer_path: str = "/home/penguin/data/ka/packed_dataset/tokenizer.pkl"
     train_data_path: str = "/home/penguin/data/ka/packed_dataset/train.array_record"
     test_data_path: str = "/home/penguin/data/ka/packed_dataset/test.array_record"
     batch_size: int = 12
