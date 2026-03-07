@@ -1,6 +1,7 @@
 import pandas as pd
 from pathlib import Path
 import librosa
+from pandas.core.frame import DataFrame
 import soundfile as sf
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -9,7 +10,8 @@ import argparse
 import string
 import numpy as np
 
-def resample_and_write(row: tuple, dst_path: Path) -> tuple[str, None | Exception]:
+
+def resample_and_write(row: tuple, dst_path: Path) -> tuple[str, str | None | Exception, str | None, str | None, str | None]:
     """
     resamples given audio, writes it to destination and returns old path, error, new path, label, frames
     """
@@ -25,7 +27,7 @@ def resample_and_write(row: tuple, dst_path: Path) -> tuple[str, None | Exceptio
 def process_tsv(tsv_filename: Path, root_path: Path, resampled_path: Path, max_workers: int):
     print(f"Processing {tsv_filename}...")
     # only grab columns we need
-    dataset = pd.read_csv(root_path / tsv_filename, sep='\t', usecols=['path', 'sentence'])
+    dataset = pd.read_csv(filepath_or_buffer=root_path / tsv_filename, sep='\t', usecols=['path', 'sentence']) #ty: ignore[no-matching-overload]
 
     # changing relative path to full path
     dataset['path'] = dataset['path'].apply(lambda path: root_path / 'clips' / path)

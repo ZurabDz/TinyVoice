@@ -1,5 +1,6 @@
 import os
 
+# TODO: Which ones are necessary
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
@@ -40,10 +41,7 @@ data_config = DataConfig()
 train_config = TrainingConfig()
 
 tokenizer_path = Path(data_config.tokenizer_path)
-if tokenizer_path.suffix == ".json":
-    tokenizer = HuggingFaceBPETokenizer.from_pretrained(tokenizer_path.parent)
-else:
-    tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
+tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
 
 featurizer_config = FeaturizerConfig()
 conformer_config = ConformerConfig()
@@ -65,7 +63,7 @@ model = ZipformerEncoder(
     n_fft=featurizer_config.n_fft,
     n_window_size=featurizer_config.win_length,
     n_window_stride=featurizer_config.hop_length,
-    dtype=jnp.bfloat16,
+    dtype=train_config.dtype,
     rngs=nnx.Rngs(0),
 )
 model.initialize_weights(jax.random.PRNGKey(0))
@@ -132,7 +130,7 @@ processed_train_dataset = (
         batch_fn=functools.partial(
             batch_fn,
             bucket_sizes=data_config.bucket_sizes,
-            pad_token_id=tokenizer.blank_id,
+            pad_token_id=tokenizer.label_pad_token,
         ),
     )
     .to_iter_dataset(read_options=read_options)
@@ -145,7 +143,7 @@ processed_test_dataset = (
         batch_fn=functools.partial(
             batch_fn,
             bucket_sizes=data_config.bucket_sizes,
-            pad_token_id=tokenizer.blank_id,
+            pad_token_id=tokenizer.label_pad_token,
         ),
     )
     .to_iter_dataset(read_options=read_options)
@@ -239,23 +237,6 @@ def eval_step(
 model_graphdef, model_state = nnx.split(model)
 optimizer_graphdef, optimizer_state = nnx.split(optimizer)
 
-# mngr.save(
-#     0,
-#     args=ocp.args.Composite(
-#         model=ocp.args.StandardSave(model_state),
-#         optimizer=ocp.args.StandardSave(optimizer_state),
-#     ),
-# )
-# mngr.wait_until_finished()
-
-# Pre-compilation (Warmup)
-# Use .lower().compile() to trigger AOT compilation for each bucket shape
-# WITHOUT executing the function or touching real weights.
-#
-# Key points:
-#  - train_step is already @jax.jit decorated, so we call it directly.
-#  - We use jax.eval_shape() to get abstract ShapedArray versions of the
-#    real states so that donate_argnums never consumes/zeroes the real buffers.
 print("Pre-compiling for all buckets...")
 
 # Build abstract (shape-only) versions of the static pytrees once.
@@ -293,11 +274,6 @@ for epoch in range(train_config.num_epochs):
         processed_train_dataset, desc=f"Epoch {epoch + 1}/{train_config.num_epochs}"
     )
     for element in pbar:
-        # 1. Start profiling at global_step 10
-        # if global_step == 10:
-        #     print("Starting JAX trace...")
-        #     jax.profiler.start_trace("./logs")
-
         padded_audios, frames, padded_labels, label_lengths = element
         # Convert numpy arrays to JAX arrays
         padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
@@ -305,44 +281,24 @@ for epoch in range(train_config.num_epochs):
         frames = jnp.array(frames, dtype=jnp.int32)
         label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
 
-        # Basic validation
-        if padded_audios.shape[0] == 0:
-            print(f"Warning: Empty batch at step {global_step}, skipping...")
-            continue
+        loss, finite_ratio, model_state, optimizer_state = train_step(
+            model_graphdef,
+            model_state,
+            optimizer_graphdef,
+            optimizer_state,
+            padded_audios,
+            padded_labels,
+            frames,
+            label_lengths,
+        )
 
-        try:
-            loss, finite_ratio, model_state, optimizer_state = train_step(
-                model_graphdef,
-                model_state,
-                optimizer_graphdef,
-                optimizer_state,
-                padded_audios,
-                padded_labels,
-                frames,
-                label_lengths,
-            )
+        # Validation checks outside JIT
+        loss_val = float(loss)
+        if not jnp.isfinite(loss):
+            print(f"Warning: Non-finite loss {loss_val} at step {global_step}")
+        if loss_val > 1000:
+            print(f"Warning: Very large loss {loss_val} at step {global_step}")
 
-            # Validation checks outside JIT
-            loss_val = float(loss)
-            if not jnp.isfinite(loss):
-                print(f"Warning: Non-finite loss {loss_val} at step {global_step}")
-            if loss_val > 1000:
-                print(f"Warning: Very large loss {loss_val} at step {global_step}")
-
-        except Exception as e:
-            print(f"Error at step {global_step}: {e}")
-            print(
-                f"  Batch shape: audio={padded_audios.shape}, labels={padded_labels.shape}"
-            )
-            print(f"  Frames: {frames}, Label lengths: {label_lengths}")
-            raise
-
-        # 2. Stop profiling at global_step 20
-        # if global_step == 20:
-        #     print("Stopping JAX trace...")
-        #     jax.profiler.stop_trace()
-
-        # Convert loss to float to avoid accumulating JAX arrays
         train_loss_sum += float(loss)
         train_steps += 1
         global_step += 1

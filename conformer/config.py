@@ -6,6 +6,7 @@ import jax.numpy as jnp
 @dataclass
 class TrainingConfig:
     learning_rate: float = 5e-4
+    dtype: jnp.dtype = jnp.float32
     beta1: float = 0.9
     beta2: float = 0.98
     num_epochs: int = 100
@@ -40,7 +41,6 @@ class ConformerConfig:
     conv_dropout_p: float = 0.1
     conv_kernel_size: int = 31
     subsampling_factor: int = 4
-    dtype: jnp.dtype = jnp.float32
 
 
 @dataclass
