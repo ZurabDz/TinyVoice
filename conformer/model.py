@@ -174,13 +174,12 @@ class ZipformerMultiHeadAttention(nnx.Module):  # upgraded with RoPE
         k = self.k_proj(x).reshape(B, T, H, d)
         v = self.v_proj(x).reshape(B, T, H, d)
 
-        cos, sin = self.rope(q)  # RoPE
+        cos, sin = self.rope(q)
         q, k = apply_rotary_emb(q, k, cos, sin)
 
         scores = jnp.einsum("bthd,bshd->bhts", q, k) / jnp.sqrt(d)
 
         if mask is not None:
-            # mask is already (B, 1, 1, T), broadcasts with scores (B, H, T, T)
             scores = jnp.where(mask, scores, -1e9)
 
         attn = nnx.softmax(scores, axis=-1)
