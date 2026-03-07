@@ -11,6 +11,7 @@ class Tokenizer:
         self.char_to_id = {}
         self.id_to_char = {}
         self.blank_id = None
+        self.label_pad_token = None
         self._construct_tokenizer()
 
     def encode(self, text: str):
@@ -33,13 +34,17 @@ class Tokenizer:
 
         self.id_to_char[0] = "<BLANK>"
         self.blank_id = 0
-        self.padding_id = 0
 
         self.char_to_id["<BLANK>"] = 0
 
         for i, char in enumerate(combined_words, 1):
             self.char_to_id[char] = i
             self.id_to_char[i] = char
+
+        self.char_to_id["<PAD>"] = len(self.char_to_id)
+        self.id_to_char[self.char_to_id["<PAD>"]] = "<PAD>"
+        self.label_pad_token = self.char_to_id["<PAD>"]
+        self.vocab_size = len(self.char_to_id)
 
     def save_tokenizer(self, save_path: Path):
         pickle.dump(self, open(save_path / "tokenizer.pkl", "wb"))

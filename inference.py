@@ -5,21 +5,23 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".95"
 # os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
-from conformer.tokenizer import Tokenizer, HuggingFaceBPETokenizer
 from pathlib import Path
-from conformer.config import (
-    DataConfig,
-    ConformerConfig,
-    FeaturizerConfig,
-)
-from conformer.model import ZipformerEncoder
-from flax import nnx
-import optax
+
 import grain
-from conformer.dataset import batch_fn, ProcessAudioData
 import jax
 import jax.numpy as jnp
+import optax
 import orbax.checkpoint as ocp
+from flax import nnx
+
+from conformer.config import (
+    ConformerConfig,
+    DataConfig,
+    FeaturizerConfig,
+)
+from conformer.dataset import ProcessAudioData, batch_fn
+from conformer.model import ZipformerEncoder
+from conformer.tokenizer import HuggingFaceBPETokenizer, Tokenizer
 
 
 def main():
@@ -176,12 +178,13 @@ def main():
     predicted_texts = []
 
     count = 0
+    from jiwer import cer, wer
     from tqdm.auto import tqdm
 
     with open("transcribe.txt", "w", encoding="utf-8") as f:
         for batch in tqdm(iterator, desc="Inference"):
             # if count >= 10:
-            #     break
+                # break
 
             padded_audios, frames, padded_labels, label_lengths = batch
 
@@ -212,8 +215,8 @@ def main():
 
             count += 1
 
-    # print("WER: ", wer(ground_truth_texts, predicted_texts))
-    # print("CER: ", cer(ground_truth_texts, predicted_texts))
+    print("WER: ", wer(ground_truth_texts, predicted_texts))
+    print("CER: ", cer(ground_truth_texts, predicted_texts))
     # print(ground_truth_texts)
     # print(predicted_texts)
 

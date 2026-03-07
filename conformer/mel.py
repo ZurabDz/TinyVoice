@@ -38,9 +38,9 @@ def spec_augment(
     seq_len,
     rng,
     n_freq_masks=2,
-    n_time_masks=2,
+    n_time_masks=5,
     freq_mask_param=27,
-    time_mask_ratio=0.05,
+    time_mask_ratio=0.10,
 ):
     """SpecAugment: Time and Frequency Masking.
 

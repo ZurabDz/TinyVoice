@@ -7,28 +7,26 @@ import numpy as np
 
 class Conv2dSubSampler(nnx.Module):
     def __init__(self, d_model, rngs: nnx.Rngs, dtype=jnp.float32):
-        self.module = nnx.Sequential(
-            nnx.Conv(
-                in_features=1,
-                out_features=d_model,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                padding="VALID",
-                rngs=rngs,
-                dtype=dtype,
-            ),
-            nnx.relu,
-            nnx.Conv(
-                in_features=d_model,
-                out_features=d_model,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                padding="VALID",
-                rngs=rngs,
-                dtype=dtype,
-            ),
-            nnx.relu,
+        self.conv1 = nnx.Conv(
+            in_features=1,
+            out_features=d_model,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            rngs=rngs,
+            dtype=dtype,
         )
+        self.conv2 = nnx.Conv(
+            in_features=d_model,
+            out_features=d_model,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            rngs=rngs,
+            dtype=dtype,
+        )
+        self.act1 = SwooshR()
+        self.act2 = SwooshR()
 
     def get_length(self, seq_len):
         # Two layers of Conv2d with kernel_size=3, stride=2, padding="VALID"
@@ -39,9 +37,10 @@ class Conv2dSubSampler(nnx.Module):
 
     def __call__(self, x):
         # B, T, D, 1(C)
-        output = self.module(x)
-        batch_size, subsampled_time, subsampled_freq, d_model = output.shape
-        return output.reshape(batch_size, subsampled_time, subsampled_freq * d_model)
+        x = self.act1(self.conv1(x))
+        x = self.act2(self.conv2(x))
+        batch_size, subsampled_time, subsampled_freq, d_model = x.shape
+        return x.reshape(batch_size, subsampled_time, subsampled_freq * d_model)
 
 
 # ====================== ZIPFORMER INNOVATIONS ======================
@@ -73,7 +72,7 @@ class SwooshR(nnx.Module):  # used after conv
 class Bypass(nnx.Module):
     """Zipformer bypass: learnable mixing of residual."""
 
-    def __init__(self, dim: int, rngs: nnx.Rngs, init_value: float = 0.95):
+    def __init__(self, dim: int, rngs: nnx.Rngs, init_value: float = -1.0):
         self.alpha = nnx.Param(jnp.full((dim,), init_value))
 
     def __call__(self, x, y):
@@ -151,6 +150,7 @@ class ZipformerMultiHeadAttention(nnx.Module):  # upgraded with RoPE
         self.head_dim = d_model // num_heads
         self.dtype = dtype
 
+        self.norm = BiasNorm(d_model, rngs=rngs, dtype=dtype)
         self.q_proj = nnx.Linear(d_model, d_model, rngs=rngs, dtype=dtype)
         self.k_proj = nnx.Linear(
             d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype
@@ -160,10 +160,13 @@ class ZipformerMultiHeadAttention(nnx.Module):  # upgraded with RoPE
         )
         self.out_proj = nnx.Linear(d_model, d_model, rngs=rngs, dtype=dtype)
         self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
+        self.bypass = Bypass(d_model, rngs=rngs)
 
         self.rope = RotaryEmbedding(self.head_dim, rngs=rngs)
 
     def __call__(self, x, mask=None, training=True):
+        residual = x
+        x = self.norm(x)
         B, T, D = x.shape
         H, d = self.num_heads, self.head_dim
 
@@ -171,20 +174,19 @@ class ZipformerMultiHeadAttention(nnx.Module):  # upgraded with RoPE
         k = self.k_proj(x).reshape(B, T, H, d)
         v = self.v_proj(x).reshape(B, T, H, d)
 
-        cos, sin = self.rope(q)  # RoPE
+        cos, sin = self.rope(q)
         q, k = apply_rotary_emb(q, k, cos, sin)
 
         scores = jnp.einsum("bthd,bshd->bhts", q, k) / jnp.sqrt(d)
 
         if mask is not None:
-            # mask is already (B, 1, 1, T), broadcasts with scores (B, H, T, T)
             scores = jnp.where(mask, scores, -1e9)
 
         attn = nnx.softmax(scores, axis=-1)
         attn = self.dropout(attn, deterministic=not training)
 
         out = jnp.einsum("bhts,bshd->bthd", attn, v).reshape(B, T, D)
-        return self.out_proj(out)
+        return self.bypass(residual, self.out_proj(out))
 
 
 class ZipformerConvBlock(nnx.Module):  # kept almost same, but with SwooshR + BiasNorm
@@ -194,7 +196,9 @@ class ZipformerConvBlock(nnx.Module):  # kept almost same, but with SwooshR + Bi
         self.conv2 = nnx.Conv(
             d_model, d_model, (31,), feature_group_count=d_model, rngs=rngs, dtype=dtype
         )
+        self.norm2 = BiasNorm(d_model, rngs=rngs, dtype=dtype)
         self.conv3 = nnx.Conv(d_model, d_model, (1,), rngs=rngs, dtype=dtype)
+        self.act = SwooshR()
         self.dropout = nnx.Dropout(dropout, rngs=rngs)
         self.bypass = Bypass(d_model, rngs=rngs)
 
@@ -208,7 +212,8 @@ class ZipformerConvBlock(nnx.Module):  # kept almost same, but with SwooshR + Bi
             m = mask[:, 0, 0, :, None].astype(x.dtype)
             x = x * m
         x = self.conv2(x)
-        x = SwooshR()(x)
+        x = self.norm2(x)
+        x = self.act(x)
         if mask is not None:
             x = x * m
         x = self.conv3(x)
@@ -223,11 +228,14 @@ class ZipformerBlock(nnx.Module):
         feed_forward_expansion_factor=4,
         num_head=4,
         dropout=0.1,
+        drop_prob=0.1,
         rngs=None,
         dtype=jnp.float32,
     ):
         if rngs is None:
             rngs = nnx.Rngs(0)
+        self.rngs = rngs
+        self.drop_prob = drop_prob
         self.ff1 = ZipformerFeedForwardBlock(
             d_model, feed_forward_expansion_factor, dropout, rngs, dtype
         )
@@ -238,11 +246,15 @@ class ZipformerBlock(nnx.Module):
         )
 
     def __call__(self, x, mask=None, training=True):
-        x = self.ff1(x, training=training)
-        x = x + self.attn(x, mask=mask, training=training)
-        x = x + self.conv(x, mask=mask, training=training)
-        x = self.ff2(x, training=training)
-        return x
+        x_new = self.ff1(x, training=training)
+        x_new = self.attn(x_new, mask=mask, training=training)
+        x_new = self.conv(x_new, mask=mask, training=training)
+        x_new = self.ff2(x_new, training=training)
+        if training and self.drop_prob > 0.0:
+            # Stochastic depth: skip this block entirely with probability drop_prob
+            keep = jax.random.bernoulli(self.rngs.dropout(), 1.0 - self.drop_prob)
+            return jnp.where(keep, x_new, x)
+        return x_new
 
 
 # ====================== MAIN ENCODER ======================
@@ -256,6 +268,7 @@ class ZipformerEncoder(nnx.Module):
         feed_forward_expansion_factor=4,
         num_head=4,
         dropout=0.1,
+        layer_drop_prob=0.1,
         rngs=None,
         dtype=jnp.float32,
         **featurizer_kwargs,
@@ -285,6 +298,7 @@ class ZipformerEncoder(nnx.Module):
                     feed_forward_expansion_factor,
                     num_head,
                     dropout,
+                    layer_drop_prob,
                     rngs,
                     dtype,
                 )
@@ -348,28 +362,31 @@ class ZipformerEncoder(nnx.Module):
         """Initialize weights following NeMo best practices."""
 
         def init_fn(module):
+            nonlocal rng_key
             if isinstance(module, nnx.Linear):
+                rng_key, k1, k2 = jax.random.split(rng_key, 3)
                 d_in = module.in_features
-                stddev = 1.0 / jnp.sqrt(d_in)
+                limit = jnp.sqrt(3.0 / d_in)
                 module.kernel.value = jax.random.uniform(
-                    rng_key, module.kernel.shape, minval=-stddev, maxval=stddev
+                    k1, module.kernel.shape, minval=-limit, maxval=limit
                 )
                 if hasattr(module, "bias") and isinstance(module.bias, nnx.Param):
                     module.bias.value = jax.random.uniform(
-                        rng_key, module.bias.shape, minval=-stddev, maxval=stddev
+                        k2, module.bias.shape, minval=-limit, maxval=limit
                     )
             elif isinstance(module, nnx.Conv):
+                rng_key, k1, k2 = jax.random.split(rng_key, 3)
                 k_size = np.prod(module.kernel_size)
                 d_in = module.in_features
-                stddev = 1.0 / jnp.sqrt(k_size * d_in)
+                fan_in = k_size * d_in
+                limit = jnp.sqrt(3.0 / fan_in)
                 module.kernel.value = jax.random.uniform(
-                    rng_key, module.kernel.shape, minval=-stddev, maxval=stddev
+                    k1, module.kernel.shape, minval=-limit, maxval=limit
                 )
                 if hasattr(module, "bias") and isinstance(module.bias, nnx.Param):
                     module.bias.value = jax.random.uniform(
-                        rng_key, module.bias.shape, minval=-stddev, maxval=stddev
+                        k2, module.bias.shape, minval=-limit, maxval=limit
                     )
 
-        # Apply to all submodules
         for _, module in self.iter_modules():
             init_fn(module)
