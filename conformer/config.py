@@ -13,11 +13,11 @@ class TrainingConfig:
     batch_size: int = 16
     val_every_n_steps: int = 500
     lr_init_value: float = 1e-7
-    lr_peak_value: float = 3e-4
+    lr_peak_value: float = 5e-4
     lr_warmup_steps: int = 2500
-    lr_decay_steps: int = 250000
+    lr_decay_steps: int = 190000
     lr_end_value: float = 1e-6
-    grad_accumulation_steps: int = 2
+    grad_accumulation_steps: int = 1
 
 
 @dataclass
@@ -42,6 +42,7 @@ class ConformerConfig:
     conv_dropout_p: float = 0.1
     conv_kernel_size: int = 31
     subsampling_factor: int = 4
+    layer_drop_prob: float = 0.1
 
 
 @dataclass
@@ -58,9 +59,10 @@ class DataConfig:
     def __post_init__(self):
         if self.bucket_sizes is None:
             self.bucket_sizes = [
-                (48000, 94),
-                (96000, 128),
-                (128000, 154),
-                (160000, 154),
-                (192000, 154),
+                (16000, 35),    # ~1s
+                (32000, 60),    # ~2s
+                (48000, 94),    # ~3s
+                (80000, 120),   # ~5s
+                (128000, 154),  # ~8s
+                (192000, 200),  # ~12s
             ]

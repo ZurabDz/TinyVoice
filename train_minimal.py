@@ -27,8 +27,9 @@ from conformer.model import ZipformerEncoder
 from flax import nnx
 import optax
 import grain
-from conformer.dataset import batch_fn, ProcessAudioData, SpeedPerturb, FilterByDuration
+from conformer.dataset import batch_fn, ProcessAudioData, SpeedPerturb, AddNoise, FilterByDuration
 import jax
+import numpy as np
 import jax.numpy as jnp
 import jax.profiler
 from pathlib import Path
@@ -63,6 +64,7 @@ model = ZipformerEncoder(
     num_head=conformer_config.num_attention_heads,
     dropout=conformer_config.feed_forward_dropout_p,
     feed_forward_expansion_factor=conformer_config.feed_forward_expansion_factor,
+    layer_drop_prob=conformer_config.layer_drop_prob,
     d_input=featurizer_config.n_mels,
     sample_rate=featurizer_config.sampling_rate,
     n_fft=featurizer_config.n_fft,
@@ -102,11 +104,12 @@ inner_optimizer = optax.chain(
     ),
 )
 
-optimizer = nnx.Optimizer(
-    model,
-    optax.MultiSteps(inner_optimizer, every_k_schedule=accum_steps),
-    wrt=nnx.Param,
-)
+if accum_steps > 1:
+    tx = optax.MultiSteps(inner_optimizer, every_k_schedule=accum_steps)
+else:
+    tx = inner_optimizer
+
+optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 import tensorflow as tf
 import orbax.checkpoint as ocp
@@ -126,7 +129,7 @@ train_audio_source = grain.sources.ArrayRecordDataSource(data_config.train_data_
 test_audio_source = grain.sources.ArrayRecordDataSource(data_config.test_data_path)
 
 
-duration_filter = FilterByDuration(sample_rate=featurizer_config.sampling_rate, min_sec=6.0, max_sec=12.0)
+duration_filter = FilterByDuration(sample_rate=featurizer_config.sampling_rate, min_sec=1, max_sec=12.0)
 map_train_audio_dataset = grain.MapDataset.source(train_audio_source).filter(duration_filter)
 map_test_audio_dataset = grain.MapDataset.source(test_audio_source).filter(duration_filter)
 
@@ -154,6 +157,35 @@ processed_test_dataset = (
         ),
     )
 )
+
+
+def greedy_ctc_collapse(pred_ids, blank_id):
+    """Collapse CTC output: remove blanks and repeated tokens."""
+    result = []
+    prev = blank_id
+    for p in pred_ids:
+        p = int(p)
+        if p != prev and p != blank_id:
+            result.append(p)
+        prev = p
+    return result
+
+
+def edit_distance(a, b):
+    """Levenshtein distance between two integer sequences."""
+    m, n = len(a), len(b)
+    if m == 0:
+        return n
+    if n == 0:
+        return m
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            dp[j] = prev if a[i - 1] == b[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n]
 
 
 @jax.jit(static_argnums=(0, 2), donate_argnums=(1, 3))
@@ -236,7 +268,7 @@ def eval_step(
     )
     per_sample_loss = jnp.where(jnp.isfinite(per_sample_loss), per_sample_loss, 0.0)
 
-    return per_sample_loss.mean()
+    return per_sample_loss.mean(), logits, real_times
 
 
 # Initial Split
@@ -281,6 +313,7 @@ for epoch in range(train_config.num_epochs):
         .to_iter_dataset(read_options=read_options)
         .map(ProcessAudioData(tokenizer))
         .random_map(SpeedPerturb(sample_rate=featurizer_config.sampling_rate), seed=42 + epoch)
+        .random_map(AddNoise(), seed=1000 + epoch)
         .batch(
             batch_size=data_config.batch_size,
             batch_fn=functools.partial(
@@ -347,6 +380,8 @@ for epoch in range(train_config.num_epochs):
     print(f"\nRunning validation after epoch {epoch + 1}...")
     val_loss_sum = 0.0
     val_steps = 0
+    val_cer_dist = 0
+    val_cer_len = 0
     for element in tqdm(processed_test_dataset, desc="Validation"):
         padded_audios, frames, padded_labels, label_lengths = element
         # Convert numpy arrays to JAX arrays
@@ -355,7 +390,7 @@ for epoch in range(train_config.num_epochs):
         frames = jnp.array(frames, dtype=jnp.int32)
         label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
 
-        val_loss = eval_step(
+        val_loss, logits, out_lengths = eval_step(
             model_graphdef,
             model_state,
             padded_audios,
@@ -366,14 +401,26 @@ for epoch in range(train_config.num_epochs):
         val_loss_sum += float(val_loss)
         val_steps += 1
 
+        # Greedy CTC decode for CER
+        pred_ids = np.argmax(np.array(logits), axis=-1)  # (B, T)
+        for i, (pred, length, ref, ref_len) in enumerate(
+            zip(pred_ids, np.array(out_lengths), np.array(padded_labels), np.array(label_lengths))
+        ):
+            decoded = greedy_ctc_collapse(pred[:length], tokenizer.blank_id)
+            reference = ref[:ref_len].tolist()
+            val_cer_dist += edit_distance(decoded, reference)
+            val_cer_len += len(reference)
+
     avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else 0.0
+    val_cer = val_cer_dist / max(val_cer_len, 1)
     avg_epoch_train_loss = train_loss_sum / train_steps
     print(
-        f"Epoch {epoch + 1} - Train Loss: {avg_epoch_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}\n"
+        f"Epoch {epoch + 1} - Train Loss: {avg_epoch_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val CER: {val_cer:.4f}\n"
     )
     with tb_writer.as_default():
         tf.summary.scalar("epoch/train_loss", avg_epoch_train_loss, step=global_step)
         tf.summary.scalar("epoch/val_loss", avg_val_loss, step=global_step)
+        tf.summary.scalar("epoch/val_cer", val_cer, step=global_step)
 
 # Save final checkpoint if not already saved
 if not mngr.should_save(global_step):

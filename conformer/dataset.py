@@ -71,18 +71,39 @@ class ProcessAudioData(grain.transforms.Map):
 
 
 class SpeedPerturb(grain.transforms.RandomMap):
-    def __init__(self, speeds=(0.9, 1.0, 1.1), sample_rate=16000):
-        self.speeds = speeds
+    def __init__(self, speed_range=(0.85, 1.15), sample_rate=16000):
+        self.speed_min = speed_range[0]
+        self.speed_max = speed_range[1]
         self.sample_rate = sample_rate
 
     def random_map(self, element, rng: np.random.Generator):
-        speed = rng.choice(self.speeds)
-        if speed != 1.0:
+        speed = rng.uniform(self.speed_min, self.speed_max)
+        if abs(speed - 1.0) > 0.01:
             element["audio"] = librosa.resample(
                 element["audio"],
                 orig_sr=int(self.sample_rate * speed),
                 target_sr=self.sample_rate,
             )
+        return element
+
+
+class AddNoise(grain.transforms.RandomMap):
+    """Add Gaussian noise at a random SNR between min_snr_db and max_snr_db."""
+
+    def __init__(self, min_snr_db=10.0, max_snr_db=40.0, prob=0.5):
+        self.min_snr_db = min_snr_db
+        self.max_snr_db = max_snr_db
+        self.prob = prob
+
+    def random_map(self, element, rng: np.random.Generator):
+        if rng.random() < self.prob:
+            audio = element["audio"]
+            signal_power = np.mean(audio ** 2)
+            if signal_power > 0:
+                snr_db = rng.uniform(self.min_snr_db, self.max_snr_db)
+                noise_power = signal_power / (10 ** (snr_db / 10))
+                noise = rng.normal(0, np.sqrt(noise_power), size=audio.shape).astype(np.float32)
+                element["audio"] = audio + noise
         return element
 
 

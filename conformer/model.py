@@ -7,28 +7,26 @@ import numpy as np
 
 class Conv2dSubSampler(nnx.Module):
     def __init__(self, d_model, rngs: nnx.Rngs, dtype=jnp.float32):
-        self.module = nnx.Sequential(
-            nnx.Conv(
-                in_features=1,
-                out_features=d_model,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                padding="VALID",
-                rngs=rngs,
-                dtype=dtype,
-            ),
-            nnx.relu,
-            nnx.Conv(
-                in_features=d_model,
-                out_features=d_model,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                padding="VALID",
-                rngs=rngs,
-                dtype=dtype,
-            ),
-            nnx.relu,
+        self.conv1 = nnx.Conv(
+            in_features=1,
+            out_features=d_model,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            rngs=rngs,
+            dtype=dtype,
         )
+        self.conv2 = nnx.Conv(
+            in_features=d_model,
+            out_features=d_model,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            rngs=rngs,
+            dtype=dtype,
+        )
+        self.act1 = SwooshR()
+        self.act2 = SwooshR()
 
     def get_length(self, seq_len):
         # Two layers of Conv2d with kernel_size=3, stride=2, padding="VALID"
@@ -39,9 +37,10 @@ class Conv2dSubSampler(nnx.Module):
 
     def __call__(self, x):
         # B, T, D, 1(C)
-        output = self.module(x)
-        batch_size, subsampled_time, subsampled_freq, d_model = output.shape
-        return output.reshape(batch_size, subsampled_time, subsampled_freq * d_model)
+        x = self.act1(self.conv1(x))
+        x = self.act2(self.conv2(x))
+        batch_size, subsampled_time, subsampled_freq, d_model = x.shape
+        return x.reshape(batch_size, subsampled_time, subsampled_freq * d_model)
 
 
 # ====================== ZIPFORMER INNOVATIONS ======================
@@ -73,7 +72,7 @@ class SwooshR(nnx.Module):  # used after conv
 class Bypass(nnx.Module):
     """Zipformer bypass: learnable mixing of residual."""
 
-    def __init__(self, dim: int, rngs: nnx.Rngs, init_value: float = 0.0):
+    def __init__(self, dim: int, rngs: nnx.Rngs, init_value: float = -1.0):
         self.alpha = nnx.Param(jnp.full((dim,), init_value))
 
     def __call__(self, x, y):
@@ -200,6 +199,7 @@ class ZipformerConvBlock(nnx.Module):  # kept almost same, but with SwooshR + Bi
         )
         self.norm2 = BiasNorm(d_model, rngs=rngs, dtype=dtype)
         self.conv3 = nnx.Conv(d_model, d_model, (1,), rngs=rngs, dtype=dtype)
+        self.act = SwooshR()
         self.dropout = nnx.Dropout(dropout, rngs=rngs)
         self.bypass = Bypass(d_model, rngs=rngs)
 
@@ -214,7 +214,7 @@ class ZipformerConvBlock(nnx.Module):  # kept almost same, but with SwooshR + Bi
             x = x * m
         x = self.conv2(x)
         x = self.norm2(x)
-        x = SwooshR()(x)
+        x = self.act(x)
         if mask is not None:
             x = x * m
         x = self.conv3(x)
@@ -229,11 +229,14 @@ class ZipformerBlock(nnx.Module):
         feed_forward_expansion_factor=4,
         num_head=4,
         dropout=0.1,
+        drop_prob=0.1,
         rngs=None,
         dtype=jnp.float32,
     ):
         if rngs is None:
             rngs = nnx.Rngs(0)
+        self.rngs = rngs
+        self.drop_prob = drop_prob
         self.ff1 = ZipformerFeedForwardBlock(
             d_model, feed_forward_expansion_factor, dropout, rngs, dtype
         )
@@ -244,11 +247,15 @@ class ZipformerBlock(nnx.Module):
         )
 
     def __call__(self, x, mask=None, training=True):
-        x = self.ff1(x, training=training)
-        x = self.attn(x, mask=mask, training=training)
-        x = self.conv(x, mask=mask, training=training)
-        x = self.ff2(x, training=training)
-        return x
+        x_new = self.ff1(x, training=training)
+        x_new = self.attn(x_new, mask=mask, training=training)
+        x_new = self.conv(x_new, mask=mask, training=training)
+        x_new = self.ff2(x_new, training=training)
+        if training and self.drop_prob > 0.0:
+            # Stochastic depth: skip this block entirely with probability drop_prob
+            keep = jax.random.bernoulli(self.rngs.dropout(), 1.0 - self.drop_prob)
+            return jnp.where(keep, x_new, x)
+        return x_new
 
 
 # ====================== MAIN ENCODER ======================
@@ -262,6 +269,7 @@ class ZipformerEncoder(nnx.Module):
         feed_forward_expansion_factor=4,
         num_head=4,
         dropout=0.1,
+        layer_drop_prob=0.1,
         rngs=None,
         dtype=jnp.float32,
         **featurizer_kwargs,
@@ -291,6 +299,7 @@ class ZipformerEncoder(nnx.Module):
                     feed_forward_expansion_factor,
                     num_head,
                     dropout,
+                    layer_drop_prob,
                     rngs,
                     dtype,
                 )
