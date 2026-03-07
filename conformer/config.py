@@ -6,17 +6,18 @@ import jax.numpy as jnp
 @dataclass
 class TrainingConfig:
     learning_rate: float = 5e-4
-    dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
     beta1: float = 0.9
     beta2: float = 0.98
-    num_epochs: int = 100
+    num_epochs: int = 50
     batch_size: int = 16
     val_every_n_steps: int = 500
     lr_init_value: float = 1e-7
     lr_peak_value: float = 3e-4
     lr_warmup_steps: int = 2500
-    lr_decay_steps: int = 80000
+    lr_decay_steps: int = 250000
     lr_end_value: float = 1e-6
+    grad_accumulation_steps: int = 2
 
 
 @dataclass
@@ -49,7 +50,7 @@ class DataConfig:
     tokenizer_path: str = "/home/penguin/data/ka/packed_dataset/tokenizer.pkl"
     train_data_path: str = "/home/penguin/data/ka/packed_dataset/train.array_record"
     test_data_path: str = "/home/penguin/data/ka/packed_dataset/test.array_record"
-    batch_size: int = 12
+    batch_size: int = 16
     worker_count: int = 8
     prefetch_buffer_size: int = 16
     bucket_sizes: Optional[list[tuple[int, int]]] = None
@@ -57,10 +58,9 @@ class DataConfig:
     def __post_init__(self):
         if self.bucket_sizes is None:
             self.bucket_sizes = [
-                (64000, 64),
-                (96000, 96),
-                (128000, 128),
-                (160000, 128),
-                (192000, 128),
-                (224000, 128),
+                (48000, 94),
+                (96000, 128),
+                (128000, 154),
+                (160000, 154),
+                (192000, 154),
             ]

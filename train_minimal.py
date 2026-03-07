@@ -1,5 +1,9 @@
 import os
 
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU') 
+
+# TODO: Maybe I need to recheck epoch suffling instead of simple for loop there
 # TODO: Which ones are necessary
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
@@ -23,12 +27,13 @@ from conformer.model import ZipformerEncoder
 from flax import nnx
 import optax
 import grain
-from conformer.dataset import batch_fn, ProcessAudioData
+from conformer.dataset import batch_fn, ProcessAudioData, SpeedPerturb, FilterByDuration
 import jax
 import jax.numpy as jnp
 import jax.profiler
 from pathlib import Path
 import functools
+
 
 # Enable JAX compilation caching
 cache_dir = Path.home() / ".cache" / "jax_compilation_cache"
@@ -68,11 +73,14 @@ model = ZipformerEncoder(
 )
 model.initialize_weights(jax.random.PRNGKey(0))
 
+accum_steps = train_config.grad_accumulation_steps
+
+# LR schedule counts in optimizer steps (total_steps / accum_steps)
 lr_schedule = optax.warmup_cosine_decay_schedule(
     init_value=train_config.lr_init_value,
     peak_value=train_config.lr_peak_value,
-    warmup_steps=train_config.lr_warmup_steps,
-    decay_steps=train_config.lr_decay_steps,
+    warmup_steps=train_config.lr_warmup_steps // accum_steps,
+    decay_steps=train_config.lr_decay_steps // accum_steps,
     end_value=train_config.lr_end_value,
 )
 
@@ -82,23 +90,29 @@ def weight_decay_mask(params):
     return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
 
 
+inner_optimizer = optax.chain(
+    optax.clip_by_global_norm(5.0),
+    optax.adamw(
+        learning_rate=lr_schedule,
+        b1=0.9,
+        b2=0.98,
+        eps=1e-7,
+        weight_decay=1e-2,
+        mask=weight_decay_mask,
+    ),
+)
+
 optimizer = nnx.Optimizer(
     model,
-    optax.chain(
-        optax.clip_by_global_norm(5.0),
-        optax.adamw(
-            learning_rate=lr_schedule,
-            b1=0.9,
-            b2=0.98,
-            eps=1e-7,
-            weight_decay=1e-2,
-            mask=weight_decay_mask,
-        ),
-    ),
+    optax.MultiSteps(inner_optimizer, every_k_schedule=accum_steps),
     wrt=nnx.Param,
 )
 
+import tensorflow as tf
 import orbax.checkpoint as ocp
+
+# TensorBoard Setup
+tb_writer = tf.summary.create_file_writer("./runs")
 
 # Checkpoint Setup (using refactored API)
 checkpoint_dir = os.path.abspath("./checkpoints")
@@ -112,8 +126,14 @@ train_audio_source = grain.sources.ArrayRecordDataSource(data_config.train_data_
 test_audio_source = grain.sources.ArrayRecordDataSource(data_config.test_data_path)
 
 
-map_train_audio_dataset = grain.MapDataset.source(train_audio_source)
-map_test_audio_dataset = grain.MapDataset.source(test_audio_source)
+duration_filter = FilterByDuration(sample_rate=featurizer_config.sampling_rate, min_sec=6.0, max_sec=12.0)
+map_train_audio_dataset = grain.MapDataset.source(train_audio_source).filter(duration_filter)
+map_test_audio_dataset = grain.MapDataset.source(test_audio_source).filter(duration_filter)
+
+steps_per_epoch = len(map_train_audio_dataset) // data_config.batch_size
+total_steps = steps_per_epoch * train_config.num_epochs
+print(f"Filtered train samples: {len(map_train_audio_dataset)}, steps/epoch: {steps_per_epoch}, total steps: {total_steps}")
+print(f"LR decay_steps (config): {train_config.lr_decay_steps}, should be close to total steps ({total_steps})")
 
 
 # Configure prefetching with threads (not multiprocess to avoid GPU init issues)
@@ -122,22 +142,9 @@ read_options = grain.ReadOptions(
     prefetch_buffer_size=data_config.prefetch_buffer_size * data_config.batch_size,
 )
 
-processed_train_dataset = (
-    map_train_audio_dataset.shuffle(seed=42)
-    .map(ProcessAudioData(tokenizer))
-    .batch(
-        batch_size=data_config.batch_size,
-        batch_fn=functools.partial(
-            batch_fn,
-            bucket_sizes=data_config.bucket_sizes,
-            pad_token_id=tokenizer.label_pad_token,
-        ),
-    )
-    .to_iter_dataset(read_options=read_options)
-)
-
 processed_test_dataset = (
     map_test_audio_dataset.map(ProcessAudioData(tokenizer))
+    .to_iter_dataset(read_options=read_options)
     .batch(
         batch_size=data_config.batch_size,
         batch_fn=functools.partial(
@@ -146,7 +153,6 @@ processed_test_dataset = (
             pad_token_id=tokenizer.label_pad_token,
         ),
     )
-    .to_iter_dataset(read_options=read_options)
 )
 
 
@@ -185,8 +191,7 @@ def train_step(
         is_finite = jnp.isfinite(per_sample_loss)
         finite_loss_ratio = is_finite.mean()
 
-        # Clamp infinite CTC losses (e.g. from impossible alignments)
-        # to prevent NaN gradients from corrupting the entire batch.
+        # Zero out infinite CTC losses (e.g. from impossible alignments)
         per_sample_loss = jnp.where(is_finite, per_sample_loss, 0.0)
         loss = per_sample_loss.mean()
 
@@ -222,15 +227,16 @@ def eval_step(
         jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
     ).astype(jnp.float32)
 
-    loss = optax.ctc_loss(
+    per_sample_loss = optax.ctc_loss(
         logits.astype(jnp.float32),
         logit_paddings,
         padded_labels,
         label_paddings,
         blank_id=tokenizer.blank_id,
-    ).mean()
+    )
+    per_sample_loss = jnp.where(jnp.isfinite(per_sample_loss), per_sample_loss, 0.0)
 
-    return loss
+    return per_sample_loss.mean()
 
 
 # Initial Split
@@ -270,6 +276,21 @@ for epoch in range(train_config.num_epochs):
     train_loss_sum = 0.0
     train_steps = 0
 
+    processed_train_dataset = (
+        map_train_audio_dataset.shuffle(seed=42 + epoch)
+        .to_iter_dataset(read_options=read_options)
+        .map(ProcessAudioData(tokenizer))
+        .random_map(SpeedPerturb(sample_rate=featurizer_config.sampling_rate), seed=42 + epoch)
+        .batch(
+            batch_size=data_config.batch_size,
+            batch_fn=functools.partial(
+                batch_fn,
+                bucket_sizes=data_config.bucket_sizes,
+                pad_token_id=tokenizer.label_pad_token,
+            ),
+        )
+    )
+
     pbar = tqdm(
         processed_train_dataset, desc=f"Epoch {epoch + 1}/{train_config.num_epochs}"
     )
@@ -291,13 +312,6 @@ for epoch in range(train_config.num_epochs):
             frames,
             label_lengths,
         )
-
-        # Validation checks outside JIT
-        loss_val = float(loss)
-        if not jnp.isfinite(loss):
-            print(f"Warning: Non-finite loss {loss_val} at step {global_step}")
-        if loss_val > 1000:
-            print(f"Warning: Very large loss {loss_val} at step {global_step}")
 
         train_loss_sum += float(loss)
         train_steps += 1
@@ -323,6 +337,11 @@ for epoch in range(train_config.num_epochs):
                     "step": global_step,
                 }
             )
+            current_lr = float(lr_schedule(global_step // accum_steps))
+            with tb_writer.as_default():
+                tf.summary.scalar("train/loss", avg_train_loss, step=global_step)
+                tf.summary.scalar("train/finite_ratio", float(finite_ratio), step=global_step)
+                tf.summary.scalar("train/learning_rate", current_lr, step=global_step)
 
     # Validation after each epoch
     print(f"\nRunning validation after epoch {epoch + 1}...")
@@ -348,9 +367,13 @@ for epoch in range(train_config.num_epochs):
         val_steps += 1
 
     avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else 0.0
+    avg_epoch_train_loss = train_loss_sum / train_steps
     print(
-        f"Epoch {epoch + 1} - Train Loss: {train_loss_sum / train_steps:.4f}, Val Loss: {avg_val_loss:.4f}\n"
+        f"Epoch {epoch + 1} - Train Loss: {avg_epoch_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}\n"
     )
+    with tb_writer.as_default():
+        tf.summary.scalar("epoch/train_loss", avg_epoch_train_loss, step=global_step)
+        tf.summary.scalar("epoch/val_loss", avg_val_loss, step=global_step)
 
 # Save final checkpoint if not already saved
 if not mngr.should_save(global_step):

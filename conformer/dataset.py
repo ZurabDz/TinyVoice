@@ -7,6 +7,7 @@ import grain
 from pathlib import Path
 import io
 import soundfile as sf
+import librosa
 
 
 def pack_speech_data(audio_bytes, metadata):
@@ -44,6 +45,18 @@ def create_array_record_dataset(df, save_path: Path):
     writer.close()
 
 
+class FilterByDuration(grain.transforms.Filter):
+    def __init__(self, sample_rate=16000, min_sec=6.0, max_sec=12.0):
+        self.min_frames = int(min_sec * sample_rate)
+        self.max_frames = int(max_sec * sample_rate)
+
+    def filter(self, element: bytes) -> bool:
+        metadata_len = struct.unpack("I", element[:4])[0]
+        metadata = pickle.loads(element[4 : 4 + metadata_len])
+        frames = metadata["frames"]
+        return self.min_frames <= frames <= self.max_frames
+
+
 class ProcessAudioData(grain.transforms.Map):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -55,6 +68,22 @@ class ProcessAudioData(grain.transforms.Map):
         metadata["audio"] = sig
         metadata["label"] = self.tokenizer.encode(metadata["label"])
         return metadata
+
+
+class SpeedPerturb(grain.transforms.RandomMap):
+    def __init__(self, speeds=(0.9, 1.0, 1.1), sample_rate=16000):
+        self.speeds = speeds
+        self.sample_rate = sample_rate
+
+    def random_map(self, element, rng: np.random.Generator):
+        speed = rng.choice(self.speeds)
+        if speed != 1.0:
+            element["audio"] = librosa.resample(
+                element["audio"],
+                orig_sr=int(self.sample_rate * speed),
+                target_sr=self.sample_rate,
+            )
+        return element
 
 
 def batch_fn(data, bucket_sizes=None, pad_token_id: int = 0):

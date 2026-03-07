@@ -41,10 +41,10 @@ class Tokenizer:
             self.char_to_id[char] = i
             self.id_to_char[i] = char
 
+        self.char_to_id["<PAD>"] = len(self.char_to_id)
+        self.id_to_char[self.char_to_id["<PAD>"]] = "<PAD>"
+        self.label_pad_token = self.char_to_id["<PAD>"]
         self.vocab_size = len(self.char_to_id)
-        self.char_to_id["<PAD>"] = self.vocab_size
-        self.id_to_char[self.vocab_size] = "<PAD>"
-        self.label_pad_token = self.vocab_size
 
     def save_tokenizer(self, save_path: Path):
         pickle.dump(self, open(save_path / "tokenizer.pkl", "wb"))
