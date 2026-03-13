@@ -9,6 +9,11 @@ from jax.scipy.signal import stft
 def normalize_batch(x, seq_len):
     constant = 1e-5
     batch_size, num_features, max_time = x.shape
+    
+    # Cast to float32 for stable statistics computation in fp16 training
+    compute_dtype = x.dtype
+    if compute_dtype == jnp.float16:
+        x = x.astype(jnp.float32)
 
     # time_indices [T] vs seq_len [B, 1] -> broadcasts to [B, T]
     valid_mask = jnp.arange(max_time) < seq_len[:, None]  # [B, T]
@@ -16,7 +21,7 @@ def normalize_batch(x, seq_len):
     # Expand mask for [B, C, T] -> [B, 1, T]
     x_masked = jnp.where(valid_mask[:, None, :], x, 0.0)
     x_mean_numerator = x_masked.sum(axis=-1)  # [B, C]
-    x_mean_denominator = seq_len  # [B]
+    x_mean_denominator = seq_len.astype(x.dtype)  # [B]
     x_mean = x_mean_numerator / x_mean_denominator[:, None]  # [B, C]
 
     # Subtract 1 for Bessel's correction
@@ -29,6 +34,12 @@ def normalize_batch(x, seq_len):
     x_std = x_std + constant
 
     normalized_x = (x - x_mean[:, :, None]) / x_std[:, :, None]
+    
+    # Cast back to original dtype if needed
+    if compute_dtype == jnp.float16:
+        normalized_x = normalized_x.astype(compute_dtype)
+        x_mean = x_mean.astype(compute_dtype)
+        x_std = x_std.astype(compute_dtype)
 
     return normalized_x, x_mean, x_std
 

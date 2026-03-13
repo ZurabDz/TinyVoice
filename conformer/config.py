@@ -4,7 +4,10 @@ import jax.numpy as jnp
 
 
 def _default_buckets():
-    return [
+    # Bucket sizes: (audio_frames, label_length)
+    # Ensure audio_frames >= label_length * 704 (approx subsampling factor 640 + 10% margin)
+    # Subsampling: hop_length=160 * conv_stride=4 = 640
+    raw_buckets = [
         (16000, 35),
         (32000, 60),
         (48000, 94),
@@ -12,12 +15,18 @@ def _default_buckets():
         (128000, 154),
         (192000, 200),
     ]
+    # Adjust audio_frames to be at least label_length * 704
+    adjusted = []
+    for audio_frames, label_len in raw_buckets:
+        min_audio = int(label_len * 704)
+        adjusted.append((max(audio_frames, min_audio), label_len))
+    return adjusted
 
 
 @dataclass
 class TrainingArguments:
     learning_rate: float = 5e-4
-    dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32  
     weight_decay: float = 0.01
     grad_clip: float = 5.0
 
@@ -39,14 +48,13 @@ class TrainingArguments:
     save_total_limit: int = 5
 
     d_model: int = 256
-    num_encoder_layers: int = 4
+    num_encoder_layers: int = 6
     num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 4
-    conv_expansion_factor: int = 2
     feed_forward_dropout_p: float = 0.1
     attention_dropout_p: float = 0.1
     conv_dropout_p: float = 0.1
-    conv_kernel_size: int = 31
+    conv_kernel_size: int = 9
     subsampling_factor: int = 4
     layer_drop_prob: float = 0.1
 
@@ -87,11 +95,10 @@ class ConformerConfig:
     encoder_dim: int = 256
     num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 4
-    conv_expansion_factor: int = 2
     feed_forward_dropout_p: float = 0.1
     attention_dropout_p: float = 0.1
     conv_dropout_p: float = 0.1
-    conv_kernel_size: int = 31
+    conv_kernel_size: int = 9
     subsampling_factor: int = 4
     layer_drop_prob: float = 0.1
 
@@ -109,11 +116,4 @@ class DataConfig:
 
     def __post_init__(self):
         if self.bucket_sizes is None:
-            self.bucket_sizes = [
-                (16000, 35),
-                (32000, 60),
-                (48000, 94),
-                (80000, 120),
-                (128000, 154),
-                (192000, 200),
-            ]
+            self.bucket_sizes = _default_buckets()

@@ -1,224 +1,129 @@
 import os
+import functools
 
 os.environ["JAX_PLATFORMS"] = "cpu"
-# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-# os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".95"
-# os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
 from pathlib import Path
 
 import grain
-import jax
 import jax.numpy as jnp
-import optax
 import orbax.checkpoint as ocp
 from flax import nnx
+from jiwer import cer, wer
+from tqdm.auto import tqdm
 
-from conformer.config import (
-    ConformerConfig,
-    DataConfig,
-    FeaturizerConfig,
-)
-from conformer.dataset import ProcessAudioData, batch_fn
-from conformer.model import ZipformerEncoder
-from conformer.tokenizer import HuggingFaceBPETokenizer, Tokenizer
+from conformer.config import TrainingArguments
+from conformer.dataset import ProcessAudioData, FilterByDuration, batch_fn
+from conformer.model import FastConformerEncoder
+from conformer.tokenizer import Tokenizer
+
+
+def ctc_decode(ids, tokenizer):
+    result, prev = [], tokenizer.blank_id
+    for _id in ids:
+        _id = int(_id)
+        if _id != prev and _id != tokenizer.blank_id:
+            result.append(_id)
+        prev = _id
+    if hasattr(tokenizer, "id_to_char"):
+        return "".join([tokenizer.id_to_char.get(i, f"[{i}]") for i in result])
+    return tokenizer.decode(result).replace("\ufffd", "")
+
+
+def decode_gt(tokens, tokenizer):
+    ids = [int(t) for t in tokens if int(t) not in (tokenizer.blank_id, tokenizer.label_pad_token)]
+    if hasattr(tokenizer, "id_to_char"):
+        return "".join([tokenizer.id_to_char.get(i, "") for i in ids])
+    return tokenizer.decode(ids)
 
 
 def main():
-    data_config = DataConfig()
+    args = TrainingArguments()
 
-    print(f"JAX background devices: {jax.devices()}")
-    print(f"Using device: {jax.devices()[0]}")
-
-    # 1. Load Tokenizer
-    tokenizer_path = Path(data_config.tokenizer_path)
-    if tokenizer_path.suffix == ".json":
-        tokenizer = HuggingFaceBPETokenizer.from_pretrained(tokenizer_path.parent)
-    else:
-        tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
-
-    featurizer_config = FeaturizerConfig()
-    conformer_config = ConformerConfig()
+    tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
+    tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
     token_count = (
-        tokenizer.vocab_size
-        if hasattr(tokenizer, "vocab_size")
-        else len(tokenizer.id_to_char)
+        tokenizer.vocab_size if hasattr(tokenizer, "vocab_size") else len(tokenizer.id_to_char)
     )
 
-    model = ZipformerEncoder(
+    model = FastConformerEncoder(
         token_count=token_count,
-        num_layers=conformer_config.num_encoder_layers,
-        d_model=conformer_config.encoder_dim,
-        num_head=conformer_config.num_attention_heads,
-        dropout=conformer_config.feed_forward_dropout_p,
-        feed_forward_expansion_factor=conformer_config.feed_forward_expansion_factor,
-        d_input=featurizer_config.n_mels,
-        sample_rate=featurizer_config.sampling_rate,
-        n_fft=featurizer_config.n_fft,
-        n_window_size=featurizer_config.win_length,
-        n_window_stride=featurizer_config.hop_length,
-        dtype=jnp.bfloat16,
+        num_layers=args.num_encoder_layers,
+        d_model=args.d_model,
+        num_head=args.num_attention_heads,
+        dropout=args.feed_forward_dropout_p,
+        feed_forward_expansion_factor=args.feed_forward_expansion_factor,
+        conv_kernel_size=args.conv_kernel_size,
+        layer_drop_prob=args.layer_drop_prob,
+        d_input=args.n_mels,
+        sample_rate=args.sampling_rate,
+        n_fft=args.n_fft,
+        n_window_size=args.win_length,
+        n_window_stride=args.hop_length,
+        dtype=args.dtype,
         rngs=nnx.Rngs(0),
     )
 
-    # Setup Checkpoint Manager (using refactored API)
-    checkpoint_dir = os.path.abspath("./checkpoints")
-    if not os.path.exists(checkpoint_dir):
-        print(f"No checkpoint directory found at {checkpoint_dir}")
-        return
-
-    options = ocp.CheckpointManagerOptions()
-    mngr = ocp.CheckpointManager(checkpoint_dir, options=options)
-
+    checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+    mngr = ocp.CheckpointManager(checkpoint_dir)
     latest_step = mngr.latest_step()
     if latest_step is None:
         print("No checkpoints found.")
         return
 
-    print(f"Restoring checkpoint from step {latest_step}...")
-
-    # Setup model structure for restoration
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=1e-4,
-        warmup_steps=100,
-        decay_steps=1000,
-        end_value=0.0,
-    )
-
-    # Weight decay mask: apply weight decay only to weights (ndim > 1), not biases (ndim == 1)
-    def weight_decay_mask(params):
-        return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
-
-    optimizer = nnx.Optimizer(
-        model,
-        optax.chain(
-            optax.clip_by_global_norm(5.0),
-            optax.adamw(
-                learning_rate=lr_schedule,
-                b1=0.9,
-                b2=0.98,
-                weight_decay=1e-3,
-                mask=weight_decay_mask,
-            ),
-        ),
-        wrt=nnx.Param,
-    )
-
-    # Restore checkpoint using refactored API
     restored = mngr.restore(
         latest_step,
-        args=ocp.args.Composite(
-            model=ocp.args.StandardRestore(nnx.state(model)),
-            optimizer=ocp.args.StandardRestore(nnx.state(optimizer)),
-        ),
+        args=ocp.args.Composite(model=ocp.args.StandardRestore(nnx.state(model))),
     )
-
-    # Update model with restored state
     nnx.update(model, restored.model)
-    print("Model restored successfully.")
     mngr.close()
+    print(f"Restored checkpoint step {latest_step}")
 
-    # 5. Load Test Data
-    try:
-        test_audio_source = grain.sources.ArrayRecordDataSource(
-            data_config.test_data_path
-        )
-    except Exception as e:
-        print(f"Error loading test data: {e}. Please ensure data is generated.")
-        return
-
-    map_test_audio_dataset = grain.MapDataset.source(test_audio_source)
-
+    test_source = grain.sources.ArrayRecordDataSource(
+        args.data_dir + "/packed_dataset/test.array_record"
+    )
+    read_options = grain.ReadOptions(
+        num_threads=args.worker_count,
+        prefetch_buffer_size=args.prefetch_buffer_size * args.batch_size,
+    )
     processed_test_dataset = (
-        map_test_audio_dataset.map(ProcessAudioData(tokenizer)).batch(
-            batch_size=1, batch_fn=batch_fn
-        )  # Batch size 1 for inference demo
+        grain.MapDataset.source(test_source)
+        .filter(FilterByDuration(sample_rate=args.sampling_rate, min_sec=1, max_sec=12.0))
+        .map(ProcessAudioData(tokenizer))
+        .to_iter_dataset(read_options=read_options)
+        .batch(
+            batch_size=args.batch_size,
+            batch_fn=functools.partial(
+                batch_fn,
+                bucket_sizes=args.bucket_sizes,
+                pad_token_id=tokenizer.label_pad_token,
+            ),
+        )
     )
 
-    # 6. Run Inference
-    iterator = iter(processed_test_dataset)
-
-    def only_georgian_chars(text):
-        # Keep Georgian characters, spaces, and common punctuation
-        return text
-
-    def ctc_decode(ids, tokenizer):
-        """CTC greedy decode: collapse repeated tokens and remove blanks."""
-        collapsed_ids = []
-        prev = -1
-        for _id in ids:
-            _id = int(_id)
-            if _id != prev:
-                if _id != tokenizer.blank_id and _id != getattr(
-                    tokenizer, "padding_id", -1
-                ):
-                    collapsed_ids.append(_id)
-            prev = _id
-
-        # Use tokenizer's decode method (works for both char-level and BPE)
-        if hasattr(tokenizer, "id_to_char"):
-            return "".join(
-                [tokenizer.id_to_char.get(_id, f"[{_id}]") for _id in collapsed_ids]
-            )
-        else:
-            return tokenizer.decode(collapsed_ids).replace("\ufffd", "")
-
-    def decode_gt(tokens, tokenizer):
-        """Decode ground truth token IDs."""
-        ids = [int(t) for t in tokens if int(t) != tokenizer.blank_id]
-        if hasattr(tokenizer, "id_to_char"):
-            return "".join([tokenizer.id_to_char.get(_id, "") for _id in ids])
-        else:
-            return tokenizer.decode(ids)
-
-    print("\nStarting Inference on Test Set (Top 10 samples)...")
-
-    ground_truth_texts = []
-    predicted_texts = []
-
-    count = 0
-    from jiwer import cer, wer
-    from tqdm.auto import tqdm
+    ground_truth_texts, predicted_texts = [], []
 
     with open("transcribe.txt", "w", encoding="utf-8") as f:
-        for batch in tqdm(iterator, desc="Inference"):
-            # if count >= 10:
-                # break
-
+        for count, batch in enumerate(tqdm(processed_test_dataset, desc="Inference")):
             padded_audios, frames, padded_labels, label_lengths = batch
+            padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
+            frames = jnp.array(frames, dtype=jnp.int32)
 
-            # Forward pass
-            logits, output_seq_len = model(
-                padded_audios, training=False, inputs_lengths=frames
-            )
+            logits, out_lengths = model(padded_audios, training=False, inputs_lengths=frames)
 
-            # Greedy decoding: argmax with sequence length masking
-            seq_len = int(output_seq_len[0])
-            predicted_ids = jnp.argmax(logits[0, :seq_len], axis=-1)
+            import numpy as np
+            pred_ids = np.argmax(np.array(logits), axis=-1)
+            for i in range(len(pred_ids)):
+                pred_text = ctc_decode(pred_ids[i, : int(out_lengths[i])], tokenizer)
+                gt_text = decode_gt(padded_labels[i][: int(label_lengths[i])], tokenizer)
+                f.write(f"\nSample {count * args.batch_size + i + 1}:\n")
+                f.write(f"Ground Truth: {gt_text}\n")
+                f.write(f"Prediction:   {pred_text}\n")
+                ground_truth_texts.append(gt_text)
+                predicted_texts.append(pred_text)
 
-            # Batch size is 1, take first element
-            pred_tokens = predicted_ids
-            gt_tokens = padded_labels[0][
-                : int(label_lengths[0])
-            ]  # Slice to actual length
-
-            pred_text = ctc_decode(pred_tokens, tokenizer)
-            gt_text = decode_gt(gt_tokens, tokenizer)
-
-            f.write(f"\nSample {count + 1}:\n")
-            f.write(f"Ground Truth: {gt_text}\n")
-            f.write(f"Prediction:   {pred_text}\n")
-
-            ground_truth_texts.append(only_georgian_chars(gt_text))
-            predicted_texts.append(only_georgian_chars(pred_text))
-
-            count += 1
-
-    print("WER: ", wer(ground_truth_texts, predicted_texts))
-    print("CER: ", cer(ground_truth_texts, predicted_texts))
-    # print(ground_truth_texts)
-    # print(predicted_texts)
+    print("WER:", wer(ground_truth_texts, predicted_texts))
+    print("CER:", cer(ground_truth_texts, predicted_texts))
 
 
 if __name__ == "__main__":

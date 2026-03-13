@@ -19,9 +19,9 @@ os.environ["XLA_FLAGS"] = (
 
 from conformer.tokenizer import Tokenizer, HuggingFaceBPETokenizer
 from conformer.config import TrainingArguments
-from conformer.utils.timing import Timer, Timers
-from conformer.model import ZipformerEncoder
+from conformer.model import FastConformerEncoder
 from flax import nnx
+from flax.training import dynamic_scale as dynamic_scale_lib
 import optax
 import grain
 from conformer.dataset import (
@@ -47,6 +47,8 @@ jax.config.update("jax_compilation_cache_dir", str(cache_dir))
 from tqdm.auto import tqdm
 
 args = TrainingArguments()
+print(f"Using dtype: {args.dtype}")
+print(f"Bucket sizes (audio_frames, label_len): {args.bucket_sizes}")
 
 tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
 tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
@@ -56,13 +58,14 @@ token_count = (
     else len(tokenizer.id_to_char)
 )
 
-model = ZipformerEncoder(
+model = FastConformerEncoder(
     token_count=token_count,
     num_layers=args.num_encoder_layers,
     d_model=args.d_model,
     num_head=args.num_attention_heads,
     dropout=args.feed_forward_dropout_p,
     feed_forward_expansion_factor=args.feed_forward_expansion_factor,
+    conv_kernel_size=args.conv_kernel_size,
     layer_drop_prob=args.layer_drop_prob,
     d_input=args.n_mels,
     sample_rate=args.sampling_rate,
@@ -91,7 +94,11 @@ def weight_decay_mask(params):
     return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
 
 
+# For fp16 training, use tighter gradient clipping
+grad_clip_value = 0.5 if args.dtype == jnp.float16 else 1.0
 inner_optimizer = optax.chain(
+    # Clip by value first to prevent extreme gradients in fp16
+    optax.clip(grad_clip_value),
     optax.clip_by_global_norm(args.grad_clip),
     optax.adamw(
         learning_rate=lr_schedule,
@@ -228,8 +235,10 @@ def train_step(
             jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
         ).astype(jnp.float32)
 
+        # Clip logits for fp16 stability to prevent NaN in CTC loss
+        logits_f32 = jnp.clip(logits.astype(jnp.float32), -50.0, 50.0)
         per_sample_loss = optax.ctc_loss(
-            logits.astype(jnp.float32),
+            logits_f32,
             logit_paddings,
             padded_labels,
             label_paddings,
@@ -244,7 +253,20 @@ def train_step(
 
         return loss, finite_loss_ratio
 
-    (loss, finite_loss_ratio), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    LOSS_SCALE = 2**15
+
+    def scaled_loss_fn(model):
+        loss, aux = loss_fn(model)
+        return loss * LOSS_SCALE, aux
+
+    (scaled_loss, finite_loss_ratio), grads = nnx.value_and_grad(scaled_loss_fn, has_aux=True)(model)
+    loss = scaled_loss / LOSS_SCALE
+
+    # Unscale gradients and skip update if any grad is inf/nan (scale overflow)
+    grads = jax.tree.map(lambda g: g / LOSS_SCALE, grads)
+    grad_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(g)) for g in jax.tree.leaves(grads)]))
+    grads = jax.tree.map(lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)), grads)
+
     optimizer.update(model=model, grads=grads)
 
     _, new_model_state = nnx.split(model)
@@ -274,8 +296,10 @@ def eval_step(
         jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
     ).astype(jnp.float32)
 
+    # Clip logits for fp16 stability to prevent NaN in CTC loss
+    logits_f32 = jnp.clip(logits.astype(jnp.float32), -50.0, 50.0)
     per_sample_loss = optax.ctc_loss(
-        logits.astype(jnp.float32),
+        logits_f32,
         logit_paddings,
         padded_labels,
         label_paddings,
@@ -318,7 +342,6 @@ for b_frames, b_label in tqdm(args.bucket_sizes, desc="Compiling buckets"):
 
 # Training Loop
 global_step = 0
-timers = Timers()
 
 for epoch in range(args.num_epochs):
     train_loss_sum = 0.0
@@ -344,52 +367,43 @@ for epoch in range(args.num_epochs):
 
     pbar = tqdm(processed_train_dataset, desc=f"Epoch {epoch + 1}/{args.num_epochs}")
     for element in pbar:
-        with timers("data_loading"):
-            padded_audios, frames, padded_labels, label_lengths = element
-            padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
-            padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
-            frames = jnp.array(frames, dtype=jnp.int32)
-            label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
+        padded_audios, frames, padded_labels, label_lengths = element
+        padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
+        padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
+        frames = jnp.array(frames, dtype=jnp.int32)
+        label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
 
-        with timers("train_step"):
-            loss, finite_ratio, model_state, optimizer_state = train_step(
-                model_graphdef,
-                model_state,
-                optimizer_graphdef,
-                optimizer_state,
-                padded_audios,
-                padded_labels,
-                frames,
-                label_lengths,
-            )
+        loss, finite_ratio, model_state, optimizer_state = train_step(
+            model_graphdef,
+            model_state,
+            optimizer_graphdef,
+            optimizer_state,
+            padded_audios,
+            padded_labels,
+            frames,
+            label_lengths,
+        )
 
         train_loss_sum += float(loss)
         train_steps += 1
         global_step += 1
 
-        train_time_accum += timers("train_step").current_elapsed
-        data_time_accum += timers("data_loading").current_elapsed
-
-        with timers("checkpoint"):
-            if global_step > 1 and mngr.should_save(global_step):
-                mngr.save(
-                    global_step,
-                    args=ocp.args.Composite(
-                        model=ocp.args.StandardSave(model_state),
-                        optimizer=ocp.args.StandardSave(optimizer_state),
-                    ),
-                )
+        if global_step > 1 and mngr.should_save(global_step):
+            mngr.save(
+                global_step,
+                args=ocp.args.Composite(
+                    model=ocp.args.StandardSave(model_state),
+                    optimizer=ocp.args.StandardSave(optimizer_state),
+                ),
+            )
 
         if global_step % 5 == 0 or global_step < 10:
             avg_train_loss = train_loss_sum / train_steps
-            avg_step_time = (train_time_accum / train_steps) * 1000
-            avg_data_time = (data_time_accum / train_steps) * 1000
             pbar.set_postfix(
                 {
                     "loss": f"{avg_train_loss:.4f}",
                     "finite": f"{float(finite_ratio):.2f}",
                     "step": global_step,
-                    "time": f"{avg_step_time:.0f}ms",
                 }
             )
             current_lr = float(lr_schedule(global_step // accum_steps))
@@ -399,18 +413,10 @@ for epoch in range(args.num_epochs):
                     "train/finite_ratio", float(finite_ratio), step=global_step
                 )
                 tf.summary.scalar("train/learning_rate", current_lr, step=global_step)
-                tf.summary.scalar("train/step_time_ms", avg_step_time, step=global_step)
-                tf.summary.scalar("train/data_time_ms", avg_data_time, step=global_step)
 
-    timers.log(
-        ["data_loading", "train_step", "checkpoint"],
-        normalizer=train_steps,
-        tb_writer=tb_writer,
-        step=global_step,
-    )
+
     train_time_accum = 0.0
     data_time_accum = 0.0
-    timers.reset()
 
     # Validation after each epoch
     print(f"\nRunning validation after epoch {epoch + 1}...")
@@ -419,26 +425,24 @@ for epoch in range(args.num_epochs):
     val_cer_dist = 0
     val_cer_len = 0
 
-    val_timer = Timer("validation")
-    with val_timer:
-        for element in tqdm(processed_test_dataset, desc="Validation"):
-            padded_audios, frames, padded_labels, label_lengths = element
-            # Convert numpy arrays to JAX arrays
-            padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
-            padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
-            frames = jnp.array(frames, dtype=jnp.int32)
-            label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
+    for element in tqdm(processed_test_dataset, desc="Validation"):
+        padded_audios, frames, padded_labels, label_lengths = element
+        # Convert numpy arrays to JAX arrays
+        padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
+        padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
+        frames = jnp.array(frames, dtype=jnp.int32)
+        label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
 
-            val_loss, logits, out_lengths = eval_step(
-                model_graphdef,
-                model_state,
-                padded_audios,
-                padded_labels,
-                frames,
-                label_lengths,
-            )
-            val_loss_sum += float(val_loss)
-            val_steps += 1
+        val_loss, logits, out_lengths = eval_step(
+            model_graphdef,
+            model_state,
+            padded_audios,
+            padded_labels,
+            frames,
+            label_lengths,
+        )
+        val_loss_sum += float(val_loss)
+        val_steps += 1
 
         # Greedy CTC decode for CER
         pred_ids = np.argmax(np.array(logits), axis=-1)  # (B, T)
@@ -465,9 +469,6 @@ for epoch in range(args.num_epochs):
         tf.summary.scalar("epoch/train_loss", avg_epoch_train_loss, step=global_step)
         tf.summary.scalar("epoch/val_loss", avg_val_loss, step=global_step)
         tf.summary.scalar("epoch/val_cer", val_cer, step=global_step)
-        tf.summary.scalar(
-            "timers/validation", val_timer.elapsed * 1000, step=global_step
-        )
 
 # Save final checkpoint if not already saved
 if not mngr.should_save(global_step):
