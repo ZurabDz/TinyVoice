@@ -4,8 +4,6 @@ import tensorflow as tf
 
 tf.config.set_visible_devices([], "GPU")
 
-# TODO: Maybe I need to recheck epoch suffling instead of simple for loop there
-# TODO: Which ones are necessary
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
@@ -18,25 +16,21 @@ os.environ["XLA_FLAGS"] = (
 )
 
 from conformer.tokenizer import Tokenizer, HuggingFaceBPETokenizer
+from conformer.decode import greedy_ctc_decode
 from conformer.config import TrainingArguments
 from conformer.model import FastConformerEncoder
 from flax import nnx
-from flax.training import dynamic_scale as dynamic_scale_lib
 import optax
-import grain
 from conformer.dataset import (
-    batch_fn,
-    ProcessAudioData,
-    SpeedPerturb,
-    AddNoise,
-    FilterByDuration,
+    build_data_sources,
+    build_train_loader,
+    build_test_loader,
 )
 import jax
 import numpy as np
 import jax.numpy as jnp
 import jax.profiler
 from pathlib import Path
-import functools
 
 
 # Enable JAX compilation caching
@@ -46,9 +40,18 @@ jax.config.update("jax_compilation_cache_dir", str(cache_dir))
 
 from tqdm.auto import tqdm
 
+DEV_MODE = os.environ.get("TINYVOICE_DEV", "0") == "1"
+DEV_STEPS = int(os.environ.get("TINYVOICE_DEV_STEPS", "10000"))
+
 args = TrainingArguments()
-print(f"Using dtype: {args.dtype}")
-print(f"Bucket sizes (audio_frames, label_len): {args.bucket_sizes}")
+if DEV_MODE:
+    # Use the largest bucket only — every real sample fits, so the shape never
+    # changes after step 1. Lazy JIT fires exactly once on the first batch.
+    args.bucket_sizes = [args.bucket_sizes[-1]]
+    print(f"DEV MODE: single bucket {args.bucket_sizes}, stopping after {DEV_STEPS} steps")
+else:
+    print(f"Using dtype: {args.dtype}")
+    print(f"Bucket sizes (audio_frames, label_len): {args.bucket_sizes}")
 
 tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
 tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
@@ -117,6 +120,13 @@ else:
 
 optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
+# Adaptive loss scale state (replicates DynamicScale defaults)
+loss_scale = jnp.array(2**15, dtype=jnp.float32)
+scale_fin_steps = jnp.array(0, dtype=jnp.int32)
+SCALE_GROWTH_FACTOR = 2.0
+SCALE_BACKOFF_FACTOR = 0.5
+SCALE_GROWTH_INTERVAL = 2000
+
 import tensorflow as tf
 import orbax.checkpoint as ocp
 
@@ -132,26 +142,9 @@ options = ocp.CheckpointManagerOptions(
 )
 mngr = ocp.CheckpointManager(checkpoint_dir, options=options)
 
-train_audio_source = grain.sources.ArrayRecordDataSource(
-    args.data_dir + "/packed_dataset/train.array_record"
+map_train_audio_dataset, map_test_audio_dataset, steps_per_epoch = build_data_sources(
+    args.data_dir, args.sampling_rate, args.batch_size
 )
-
-test_audio_source = grain.sources.ArrayRecordDataSource(
-    args.data_dir + "/packed_dataset/test.array_record"
-)
-
-
-duration_filter = FilterByDuration(
-    sample_rate=args.sampling_rate, min_sec=1, max_sec=12.0
-)
-map_train_audio_dataset = grain.MapDataset.source(train_audio_source).filter(
-    duration_filter
-)
-map_test_audio_dataset = grain.MapDataset.source(test_audio_source).filter(
-    duration_filter
-)
-
-steps_per_epoch = len(map_train_audio_dataset) // args.batch_size
 total_steps = steps_per_epoch * args.num_epochs
 print(
     f"Filtered train samples: {len(map_train_audio_dataset)}, steps/epoch: {steps_per_epoch}, total steps: {total_steps}"
@@ -160,37 +153,7 @@ print(
     f"LR decay_steps (config): {args.lr_decay_steps}, should be close to total steps ({total_steps})"
 )
 
-
-# Configure prefetching with threads (not multiprocess to avoid GPU init issues)
-read_options = grain.ReadOptions(
-    num_threads=args.worker_count,
-    prefetch_buffer_size=args.prefetch_buffer_size * args.batch_size,
-)
-
-processed_test_dataset = (
-    map_test_audio_dataset.map(ProcessAudioData(tokenizer))
-    .to_iter_dataset(read_options=read_options)
-    .batch(
-        batch_size=args.batch_size,
-        batch_fn=functools.partial(
-            batch_fn,
-            bucket_sizes=args.bucket_sizes,
-            pad_token_id=tokenizer.label_pad_token,
-        ),
-    )
-)
-
-
-def greedy_ctc_collapse(pred_ids, blank_id):
-    """Collapse CTC output: remove blanks and repeated tokens."""
-    result = []
-    prev = blank_id
-    for p in pred_ids:
-        p = int(p)
-        if p != prev and p != blank_id:
-            result.append(p)
-        prev = p
-    return result
+processed_test_dataset = build_test_loader(map_test_audio_dataset, tokenizer, args)
 
 
 def edit_distance(a, b):
@@ -216,6 +179,7 @@ def train_step(
     model_state,
     optimizer_graphdef,
     optimizer_state,
+    loss_scale,
     padded_audios,
     padded_labels,
     frames,
@@ -249,30 +213,31 @@ def train_step(
 
         # Zero out infinite CTC losses (e.g. from impossible alignments)
         per_sample_loss = jnp.where(is_finite, per_sample_loss, 0.0)
-        loss = per_sample_loss.mean()
-
-        return loss, finite_loss_ratio
-
-    LOSS_SCALE = 2**15
+        return per_sample_loss.mean(), finite_loss_ratio
 
     def scaled_loss_fn(model):
         loss, aux = loss_fn(model)
-        return loss * LOSS_SCALE, aux
+        return loss * loss_scale, aux
 
-    (scaled_loss, finite_loss_ratio), grads = nnx.value_and_grad(scaled_loss_fn, has_aux=True)(model)
-    loss = scaled_loss / LOSS_SCALE
+    (scaled_loss, finite_loss_ratio), grads = nnx.value_and_grad(
+        scaled_loss_fn, has_aux=True
+    )(model)
+    loss = scaled_loss / loss_scale
 
-    # Unscale gradients and skip update if any grad is inf/nan (scale overflow)
-    grads = jax.tree.map(lambda g: g / LOSS_SCALE, grads)
-    grad_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(g)) for g in jax.tree.leaves(grads)]))
-    grads = jax.tree.map(lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)), grads)
+    grads = jax.tree.map(lambda g: g / loss_scale, grads)
+    grad_finite = jnp.all(
+        jnp.array([jnp.all(jnp.isfinite(g)) for g in jax.tree.leaves(grads)])
+    )
+    grads = jax.tree.map(
+        lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)), grads
+    )
 
     optimizer.update(model=model, grads=grads)
 
     _, new_model_state = nnx.split(model)
     _, new_optimizer_state = nnx.split(optimizer)
 
-    return loss, finite_loss_ratio, new_model_state, new_optimizer_state
+    return loss, finite_loss_ratio, grad_finite, new_model_state, new_optimizer_state
 
 
 @jax.jit(static_argnums=(0,))
@@ -314,79 +279,86 @@ def eval_step(
 model_graphdef, model_state = nnx.split(model)
 optimizer_graphdef, optimizer_state = nnx.split(optimizer)
 
-print("Pre-compiling for all buckets...")
+if not DEV_MODE:
+    print("Pre-compiling for all buckets...")
 
-# Build abstract (shape-only) versions of the static pytrees once.
-abstract_model_state = jax.eval_shape(lambda: model_state)
-abstract_optimizer_state = jax.eval_shape(lambda: optimizer_state)
+    # Build abstract (shape-only) versions of the static pytrees once.
+    abstract_model_state = jax.eval_shape(lambda: model_state)
+    abstract_optimizer_state = jax.eval_shape(lambda: optimizer_state)
 
-for b_frames, b_label in tqdm(args.bucket_sizes, desc="Compiling buckets"):
-    # Dummy inputs — only shape & dtype matter, values are never used.
-    d_audios = jnp.zeros((args.batch_size, b_frames), dtype=jnp.float32)
-    d_labels = jnp.zeros((args.batch_size, b_label), dtype=jnp.int32)
-    d_frames = jnp.full((args.batch_size,), b_frames, dtype=jnp.int32)
-    d_label_lengths = jnp.full((args.batch_size,), b_label, dtype=jnp.int32)
+    for b_frames, b_label in tqdm(args.bucket_sizes, desc="Compiling buckets"):
+        # Dummy inputs — only shape & dtype matter, values are never used.
+        d_audios = jnp.zeros((args.batch_size, b_frames), dtype=jnp.float32)
+        d_labels = jnp.zeros((args.batch_size, b_label), dtype=jnp.int32)
+        d_frames = jnp.full((args.batch_size,), b_frames, dtype=jnp.int32)
+        d_label_lengths = jnp.full((args.batch_size,), b_label, dtype=jnp.int32)
 
-    # Lower using abstract states — real buffers are never donated.
-    train_step.lower(
-        model_graphdef,
-        abstract_model_state,
-        optimizer_graphdef,
-        abstract_optimizer_state,
-        d_audios,
-        d_labels,
-        d_frames,
-        d_label_lengths,
-    ).compile()
-    print(f"Compiled bucket: audio_frames={b_frames}, label_len={b_label}")
+        # Lower using abstract states — real buffers are never donated.
+        train_step.lower(
+            model_graphdef,
+            abstract_model_state,
+            optimizer_graphdef,
+            abstract_optimizer_state,
+            loss_scale,
+            d_audios,
+            d_labels,
+            d_frames,
+            d_label_lengths,
+        ).compile()
+        print(f"Compiled bucket: audio_frames={b_frames}, label_len={b_label}")
 
 # Training Loop
+processed_train_dataset = build_train_loader(
+    map_train_audio_dataset, tokenizer, args, args.num_epochs
+)
+train_iter = iter(processed_train_dataset)
 global_step = 0
 
 for epoch in range(args.num_epochs):
     train_loss_sum = 0.0
     train_steps = 0
-    train_time_accum = 0.0
-    data_time_accum = 0.0
 
-    processed_train_dataset = (
-        map_train_audio_dataset.shuffle(seed=42 + epoch)
-        .to_iter_dataset(read_options=read_options)
-        .map(ProcessAudioData(tokenizer))
-        .random_map(SpeedPerturb(sample_rate=args.sampling_rate), seed=42 + epoch)
-        .random_map(AddNoise(), seed=1000 + epoch)
-        .batch(
-            batch_size=args.batch_size,
-            batch_fn=functools.partial(
-                batch_fn,
-                bucket_sizes=args.bucket_sizes,
-                pad_token_id=tokenizer.label_pad_token,
-            ),
-        )
-    )
-
-    pbar = tqdm(processed_train_dataset, desc=f"Epoch {epoch + 1}/{args.num_epochs}")
-    for element in pbar:
+    pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch + 1}/{args.num_epochs}")
+    for _ in pbar:
+        element = next(train_iter)
         padded_audios, frames, padded_labels, label_lengths = element
         padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
         padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
         frames = jnp.array(frames, dtype=jnp.int32)
         label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
 
-        loss, finite_ratio, model_state, optimizer_state = train_step(
+        loss, finite_ratio, grad_finite, model_state, optimizer_state = train_step(
             model_graphdef,
             model_state,
             optimizer_graphdef,
             optimizer_state,
+            loss_scale,
             padded_audios,
             padded_labels,
             frames,
             label_lengths,
         )
 
+        # Update adaptive loss scale (replicates DynamicScale update rule)
+        if grad_finite:
+            scale_fin_steps += 1
+            if scale_fin_steps >= SCALE_GROWTH_INTERVAL:
+                loss_scale = jnp.minimum(
+                    loss_scale * SCALE_GROWTH_FACTOR, jnp.array(2**24, jnp.float32)
+                )
+                scale_fin_steps = jnp.array(0, dtype=jnp.int32)
+        else:
+            loss_scale = jnp.maximum(
+                loss_scale * SCALE_BACKOFF_FACTOR, jnp.array(1.0, jnp.float32)
+            )
+            scale_fin_steps = jnp.array(0, dtype=jnp.int32)
+
         train_loss_sum += float(loss)
         train_steps += 1
         global_step += 1
+
+        if DEV_MODE and global_step >= DEV_STEPS:
+            break
 
         if global_step > 1 and mngr.should_save(global_step):
             mngr.save(
@@ -413,10 +385,8 @@ for epoch in range(args.num_epochs):
                     "train/finite_ratio", float(finite_ratio), step=global_step
                 )
                 tf.summary.scalar("train/learning_rate", current_lr, step=global_step)
+                tf.summary.scalar("train/loss_scale", float(loss_scale), step=global_step)
 
-
-    train_time_accum = 0.0
-    data_time_accum = 0.0
 
     # Validation after each epoch
     print(f"\nRunning validation after epoch {epoch + 1}...")
@@ -454,7 +424,7 @@ for epoch in range(args.num_epochs):
                 np.array(label_lengths),
             )
         ):
-            decoded = greedy_ctc_collapse(pred[:length], tokenizer.blank_id)
+            decoded = greedy_ctc_decode(np.array(logits)[i], length, tokenizer.blank_id)
             reference = ref[:ref_len].tolist()
             val_cer_dist += edit_distance(decoded, reference)
             val_cer_len += len(reference)
@@ -469,6 +439,9 @@ for epoch in range(args.num_epochs):
         tf.summary.scalar("epoch/train_loss", avg_epoch_train_loss, step=global_step)
         tf.summary.scalar("epoch/val_loss", avg_val_loss, step=global_step)
         tf.summary.scalar("epoch/val_cer", val_cer, step=global_step)
+
+    if DEV_MODE and global_step >= DEV_STEPS:
+        break
 
 # Save final checkpoint if not already saved
 if not mngr.should_save(global_step):

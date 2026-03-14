@@ -107,6 +107,69 @@ class AddNoise(grain.transforms.RandomMap):
         return element
 
 
+def build_data_sources(data_dir: str, sampling_rate: int, batch_size: int):
+    """Create filtered map datasets for train and test splits."""
+    train_source = grain.sources.ArrayRecordDataSource(
+        data_dir + "/packed_dataset/train.array_record"
+    )
+    test_source = grain.sources.ArrayRecordDataSource(
+        data_dir + "/packed_dataset/test.array_record"
+    )
+    duration_filter = FilterByDuration(sample_rate=sampling_rate, min_sec=1, max_sec=12.0)
+    map_train = grain.MapDataset.source(train_source).filter(duration_filter)
+    map_test = grain.MapDataset.source(test_source).filter(duration_filter)
+    steps_per_epoch = len(map_train) // batch_size
+    return map_train, map_test, steps_per_epoch
+
+
+def build_train_loader(map_train: grain.MapDataset, tokenizer, args, n_epoch: int):
+    """Build the training data loader for a given epoch."""
+    import functools
+
+    read_options = grain.ReadOptions(
+        num_threads=args.worker_count,
+        prefetch_buffer_size=args.prefetch_buffer_size * args.batch_size,
+    )
+    return (
+        map_train.repeat(num_epochs=n_epoch)
+        .shuffle(seed=42)
+        .to_iter_dataset(read_options=read_options)
+        .map(ProcessAudioData(tokenizer))
+        .random_map(SpeedPerturb(sample_rate=args.sampling_rate), seed=42)
+        .random_map(AddNoise(), seed=42)
+        .batch(
+            batch_size=args.batch_size,
+            batch_fn=functools.partial(
+                batch_fn,
+                bucket_sizes=args.bucket_sizes,
+                pad_token_id=tokenizer.label_pad_token,
+            ),
+        )
+    )
+
+
+def build_test_loader(map_test, tokenizer, args):
+    """Build the test/validation data loader."""
+    import functools
+
+    read_options = grain.ReadOptions(
+        num_threads=args.worker_count,
+        prefetch_buffer_size=args.prefetch_buffer_size * args.batch_size,
+    )
+    return (
+        map_test.map(ProcessAudioData(tokenizer))
+        .to_iter_dataset(read_options=read_options)
+        .batch(
+            batch_size=args.batch_size,
+            batch_fn=functools.partial(
+                batch_fn,
+                bucket_sizes=args.bucket_sizes,
+                pad_token_id=tokenizer.label_pad_token,
+            ),
+        )
+    )
+
+
 def batch_fn(data, bucket_sizes=None, pad_token_id: int = 0):
     batch_size = len(data)
 

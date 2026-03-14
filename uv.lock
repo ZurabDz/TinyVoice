@@ -913,7 +913,7 @@ grpc = [
 
 [[package]]
 name = "grain"
-version = "0.2.15"
+version = "0.2.16"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
@@ -924,18 +924,18 @@ dependencies = [
     { name = "protobuf" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/30/3467942b46ac3c83191ad235dc6fc89ab21e9e61c1080396d0c0eb31d1f3/grain-0.2.15-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:149b195ebd2a2e06e00019af5e83d7d6fef18b6149471ba0baaf6bdfac1a0558", size = 453342, upload-time = "2025-11-25T20:17:15.108Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/23/b8d9c905d45d3802f7c5ad7e5a435820c2b5dfdfcebfbdd288e0647c72f5/grain-0.2.15-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9bbf2c57a92fae5d883e04bda35d373202f026cbd9952b9bdd831bda2c60ddd7", size = 503515, upload-time = "2025-11-25T20:17:16.216Z" },
-    { url = "https://files.pythonhosted.org/packages/ab/8f/6ce73a60e25b57dc767a27685032bd28f50f3ea9e462a1b513f214dc1f3d/grain-0.2.15-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fecc1553e539b946ed7f3508261f98309d07f899c06af1954186cf7d6a4613b2", size = 504328, upload-time = "2025-11-25T20:17:17.912Z" },
-    { url = "https://files.pythonhosted.org/packages/e1/70/64e158aa8069a04f04cb39921cf1ec74c996e2b509a27c41a11c8d181ebb/grain-0.2.15-cp312-cp312-win_amd64.whl", hash = "sha256:cc58394bdddd5db1b1e1e2878899a1e78014f60046ead82415011eca36475287", size = 444977, upload-time = "2025-11-25T20:17:19.66Z" },
-    { url = "https://files.pythonhosted.org/packages/58/35/3a342a358e3a2bb8327bdc3fa4f50999928809f067fda428280e4f9e7ec0/grain-0.2.15-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:df0c4af1442f71effc80a5b44bb33fe5aabb7b3d82d5a3ac035ae40431935c77", size = 453407, upload-time = "2025-11-25T20:17:20.834Z" },
-    { url = "https://files.pythonhosted.org/packages/49/8f/2f1dbcf35703bef636f39e77230a53b704576978a6aab66047015abd31d3/grain-0.2.15-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4766dc1355448cf7b3bdd3cc4f4639bc3433c66c5502954380b9a8f4c2b3fc94", size = 503565, upload-time = "2025-11-25T20:17:21.948Z" },
-    { url = "https://files.pythonhosted.org/packages/84/f9/376c47f9ebbe2be10605f4860e254a1633aed90405bcc25a089b787abce9/grain-0.2.15-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ae2635e3bd18b77a7add7152ee91b22aba553fa44a066aefa009d1b923ade4f2", size = 504557, upload-time = "2025-11-25T20:17:23.057Z" },
-    { url = "https://files.pythonhosted.org/packages/87/e7/334f97d5a6a65470b18256dfc64ae62416c0404b028186844bc7adc43508/grain-0.2.15-cp313-cp313-win_amd64.whl", hash = "sha256:9d3cc6edfa4d0de341de0d03ba4a8612d94639bed97fe63af3951db8305c96c0", size = 445101, upload-time = "2025-11-25T20:17:32.278Z" },
-    { url = "https://files.pythonhosted.org/packages/08/7c/674cd938b010c776bb2695bbca4a24e2db8e25c86edf0c113a637ef1834d/grain-0.2.15-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:36e1413c275741712918e528f3f65ca254ce51d60160a2b9558c020147f38e98", size = 453433, upload-time = "2025-11-25T20:17:33.973Z" },
-    { url = "https://files.pythonhosted.org/packages/1c/e1/f9b2b6a2fd9094a43a8b4a10092a464c18eef949c20b23fd31f266443aaf/grain-0.2.15-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:fedbb410486890c6e410c8d78934097b2755aa2363fbd6137b920ea5be104530", size = 503572, upload-time = "2025-11-25T20:17:35.413Z" },
-    { url = "https://files.pythonhosted.org/packages/62/c9/2708bddbd4ee834c1da87211dce06b47133ca222e2b3355104f1e22d755f/grain-0.2.15-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e1a5e20ffc29391c48b5d8f818742f4ecce957fe59ccff971c139721d31a0bf4", size = 504505, upload-time = "2025-11-25T20:17:36.753Z" },
-    { url = "https://files.pythonhosted.org/packages/01/9f/79da919a231f525145c6038d4e8a9200caef0f6c93e0e0239626f00759ae/grain-0.2.15-cp314-cp314-win_amd64.whl", hash = "sha256:d57493fa4361316755cb0564f87e62d1da1dedae4eed53acf179ec029668dee5", size = 451279, upload-time = "2025-11-25T20:17:37.834Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/cc/61e4305e89227416317b91053712cdac1418b0f5a482a7ccb319e21c46c4/grain-0.2.16-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:cd1817d3bc2bf66793167d0056c023d24a414dad2281acfc4625b73390ef4b9c", size = 526824, upload-time = "2026-02-25T16:12:24.676Z" },
+    { url = "https://files.pythonhosted.org/packages/19/08/f36a8b062f99d8c340fce219e6864edae60446fce3c5b309ec8305653579/grain-0.2.16-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f5d662e0fd4abce92e3fe31f2396e460890326b51a5452a74a46240c0874f05e", size = 583617, upload-time = "2026-02-25T16:12:26.321Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/d5/13209f236c0fec2bbcb32bd5110d7eb4faf15192b5b1e958bdf460e62ddb/grain-0.2.16-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0ab43a9127724f67f37425b598974ce3c1dedb6d33ad3d3905dd84adcc5f9a95", size = 582858, upload-time = "2026-02-25T16:12:27.879Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/c9/b940dbf99565fd1078902102ac51d9957b14921c993cf457c58f3e5c35c2/grain-0.2.16-cp312-cp312-win_amd64.whl", hash = "sha256:b5000a7a21b6cac7ecd58ac26aea341fef1e30c125c99d0fb3524f32b0a61c55", size = 512665, upload-time = "2026-02-25T16:12:29.218Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/11/0169341b9475ab2682db43b7be40fe21f6841603bed2fa5be944091877df/grain-0.2.16-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:603a0e3e015690384395a8c0243ada4d543820208577294796a8ba0fb6283a8c", size = 526899, upload-time = "2026-02-25T16:12:31.185Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/fd/c9cc44225c8e2156e4191e1038c8be8dee9fe5edef184a592e2617bbafef/grain-0.2.16-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:71876c72a2ed7ac0074561806e133725a0d28699ae259945546c05fb2d86de49", size = 583551, upload-time = "2026-02-25T16:12:32.299Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/ed/9bd6158f78e000b522a2da264b544b4cde24ece1b6e63a2a7699ed9413be/grain-0.2.16-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:33440bc6e2253650b915c9846ba541ac382169280c175fa5e464664c13c0f16f", size = 582932, upload-time = "2026-02-25T16:12:33.681Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/97/1df4ba25d711c83f7ae44d1b76206196dd42a16106229f66717d7cb71655/grain-0.2.16-cp313-cp313-win_amd64.whl", hash = "sha256:c12a8d851cb380e5ca4f639acfade1a781f2c33409eb9cf876c23b3c25c7e7a4", size = 512708, upload-time = "2026-02-25T16:12:34.748Z" },
+    { url = "https://files.pythonhosted.org/packages/39/4c/24ead40ebc98184189895a3b71910e50988a6b8af2730d49df6f98b74101/grain-0.2.16-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:59262b5d74a3e69c209ffe2f1f599db9063ac9114f19ca93d43a17939d3e96dc", size = 526921, upload-time = "2026-02-25T16:12:35.907Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/dd/d9766f03b8abc8ea8bca46b1c0deb4ce8fff7aadb0e2cae60bc1daae7c0d/grain-0.2.16-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a70df579693ac1068ab646ec770ac1f4fd1456b06ed79089c5aa3b2d9a0ca6c2", size = 583583, upload-time = "2026-02-25T16:12:37.029Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/8e/be21ee798cba3c7568198a97c8e8ebe07d8074e504c06088ec4358a7c949/grain-0.2.16-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:aa19d0ddcca020c7f78bfdaa480304e943f363061be273af216c7334fe504269", size = 582982, upload-time = "2026-02-25T16:12:38.556Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/46/8a89a61150a298e001eb76f4825cff66324692683beacc47a8efefc26cf8/grain-0.2.16-cp314-cp314-win_amd64.whl", hash = "sha256:143955414ceb8bc8df02599d83d006b5dfbc9eef55fd1dd729eb2ddefa14f821", size = 520595, upload-time = "2026-02-25T16:12:40.075Z" },
 ]
 
 [[package]]
@@ -3229,7 +3229,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "flax", specifier = ">=0.12.1" },
-    { name = "grain", specifier = ">=0.2.15" },
+    { name = "grain", specifier = ">=0.2.16" },
     { name = "iprogress", specifier = ">=0.4" },
     { name = "ipykernel", specifier = ">=7.1.0" },
     { name = "ipywidgets", specifier = ">=8.1.8" },

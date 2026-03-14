@@ -23,7 +23,7 @@ class Conv2dSubSampler(nnx.Module):
 
 
 class RotaryEmbedding(nnx.Module):
-    def __init__(self, dim: int, rngs=None):
+    def __init__(self, dim: int):
         inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
         self.inv_freq = jnp.array(inv_freq, dtype=jnp.float32)
 
@@ -167,9 +167,7 @@ class FastConformerEncoder(nnx.Module):
         if rngs is None:
             rngs = nnx.Rngs(0)
 
-        self.mel_spectogram = AudioToMelSpectrogram(n_mels=d_input, rng=rngs, **featurizer_kwargs)
-        self.mel_spectogram.normalize = True
-        self.mel_spectogram.spec_augment = True
+        self.mel_spectogram = AudioToMelSpectrogram(n_mels=d_input, rng=rngs, normalize=True, spec_augment=True, **featurizer_kwargs)
 
         self.conv_subsampler = Conv2dSubSampler(d_model, rngs, dtype)
         freq_dim = ((d_input - 3) // 2 + 1 - 3) // 2 + 1

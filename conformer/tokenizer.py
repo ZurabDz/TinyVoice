@@ -26,18 +26,14 @@ class Tokenizer:
 
     def _construct_tokenizer(self):
         df = pd.read_csv(self.file_path, sep="\t")
-        all_words = []
-        for words in df["label"].str.split():
-            all_words.extend(words)
-
-        combined_words = sorted(set(" ".join(all_words)))
+        all_chars = sorted(set("".join(df["label"].dropna())))
 
         self.id_to_char[0] = "<BLANK>"
         self.blank_id = 0
 
         self.char_to_id["<BLANK>"] = 0
 
-        for i, char in enumerate(combined_words, 1):
+        for i, char in enumerate(all_chars, 1):
             self.char_to_id[char] = i
             self.id_to_char[i] = char
 
@@ -47,11 +43,13 @@ class Tokenizer:
         self.vocab_size = len(self.char_to_id)
 
     def save_tokenizer(self, save_path: Path):
-        pickle.dump(self, open(save_path / "tokenizer.pkl", "wb"))
+        with open(save_path / "tokenizer.pkl", "wb") as f:
+            pickle.dump(self, f)
 
     @staticmethod
     def load_tokenizer(path: Path):
-        return pickle.load(open(path, "rb"))
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
 
 class HuggingFaceBPETokenizer:

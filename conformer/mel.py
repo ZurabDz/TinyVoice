@@ -107,6 +107,8 @@ class AudioToMelSpectrogram(nnx.Module):
         n_fft,
         n_mels=80,
         rng=None,
+        normalize=False,
+        spec_augment=False,
     ):
         self.rngs = rng if rng else nnx.Rngs(0)
         self.sample_rate = sample_rate
@@ -115,8 +117,8 @@ class AudioToMelSpectrogram(nnx.Module):
         self.n_fft = n_fft if n_fft else 2 ** math.ceil(math.log2(self.n_window_size))
         self.log = True
         self.pad_value = 0
-        self.normalize = False
-        self.spec_augment = False
+        self.normalize = normalize
+        self.spec_augment = spec_augment
 
         self.log_zero_guard_value = 2**-24
 
