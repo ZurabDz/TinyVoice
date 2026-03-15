@@ -7,12 +7,10 @@ def _default_buckets():
     # Ensure audio_frames >= label_length * 704 (approx subsampling factor 640 + 10% margin)
     # Subsampling: hop_length=160 * conv_stride=4 = 640
     raw_buckets = [
-        (16000, 35),
-        (32000, 60),
-        (48000, 94),
-        (80000, 120),
-        (128000, 154),
-        (192000, 200),
+        (67040,  94),
+        (87520,  120),
+        (128480, 154),
+        (176000, 200),
     ]
     # Adjust audio_frames to be at least label_length * 704
     adjusted = []
@@ -25,12 +23,12 @@ def _default_buckets():
 @dataclass
 class TrainingArguments:
     learning_rate: float = 5e-4
-    dtype: jnp.dtype = jnp.float16  
+    dtype: jnp.dtype = jnp.float16
     weight_decay: float = 0.01
     grad_clip: float = 5.0
 
     num_epochs: int = 50
-    batch_size: int = 16
+    batch_size: int = 24
     grad_accumulation_steps: int = 1
 
     lr_init_value: float = 1e-7
@@ -47,7 +45,7 @@ class TrainingArguments:
     save_total_limit: int = 5
 
     d_model: int = 256
-    num_encoder_layers: int = 6
+    num_encoder_layers: int = 8
     num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 4
     feed_forward_dropout_p: float = 0.1
@@ -64,8 +62,8 @@ class TrainingArguments:
     n_mels: int = 128
 
     data_dir: str = "/home/penguin/data/ka"
-    worker_count: int = 8
-    prefetch_buffer_size: int = 16
+    worker_count: int = 16
+    prefetch_buffer_size: int = 64
     bucket_sizes: list[tuple[int, int]] = field(default_factory=_default_buckets)
 
     def __post_init__(self):

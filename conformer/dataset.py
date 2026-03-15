@@ -133,10 +133,10 @@ def build_train_loader(map_train: grain.MapDataset, tokenizer, args, n_epoch: in
     return (
         map_train.repeat(num_epochs=n_epoch)
         .shuffle(seed=42)
-        .to_iter_dataset(read_options=read_options)
         .map(ProcessAudioData(tokenizer))
         .random_map(SpeedPerturb(sample_rate=args.sampling_rate), seed=42)
         .random_map(AddNoise(), seed=42)
+        .to_iter_dataset(read_options=read_options)
         .batch(
             batch_size=args.batch_size,
             batch_fn=functools.partial(

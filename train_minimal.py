@@ -13,6 +13,8 @@ os.environ["XLA_FLAGS"] = (
     "--xla_gpu_triton_gemm_any=true "
     "--xla_gpu_enable_latency_hiding_scheduler=true "
     "--xla_gpu_enable_highest_priority_async_stream=true "
+    "--xla_gpu_ftz=true "
+    "--xla_gpu_enable_fast_min_max=true "
 )
 
 from conformer.tokenizer import Tokenizer, HuggingFaceBPETokenizer
@@ -123,9 +125,27 @@ optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 # Adaptive loss scale state (replicates DynamicScale defaults)
 loss_scale = jnp.array(2**15, dtype=jnp.float32)
 scale_fin_steps = jnp.array(0, dtype=jnp.int32)
-SCALE_GROWTH_FACTOR = 2.0
-SCALE_BACKOFF_FACTOR = 0.5
 SCALE_GROWTH_INTERVAL = 2000
+
+
+@jax.jit
+def update_loss_scale(loss_scale, scale_fin_steps, grad_finite):
+    """Update loss scale on-device — no CPU sync required."""
+    def on_finite(args):
+        ls, sfs = args
+        new_sfs = sfs + jnp.int32(1)
+        new_ls, new_sfs = jax.lax.cond(
+            new_sfs >= SCALE_GROWTH_INTERVAL,
+            lambda: (jnp.minimum(ls * jnp.float32(2.0), jnp.float32(2**24)), jnp.int32(0)),
+            lambda: (ls, new_sfs),
+        )
+        return new_ls, new_sfs
+
+    def on_infinite(args):
+        ls, _ = args
+        return jnp.maximum(ls * jnp.float32(0.5), jnp.float32(1.0)), jnp.int32(0)
+
+    return jax.lax.cond(grad_finite, on_finite, on_infinite, (loss_scale, scale_fin_steps))
 
 import tensorflow as tf
 import orbax.checkpoint as ocp
@@ -314,44 +334,45 @@ processed_train_dataset = build_train_loader(
 train_iter = iter(processed_train_dataset)
 global_step = 0
 
+
+def _to_jax(elem):
+    """Transfer a batch tuple to JAX device arrays."""
+    return (
+        jnp.array(elem[0], dtype=jnp.float32),  # audios
+        jnp.array(elem[1], dtype=jnp.int32),     # frames
+        jnp.array(elem[2], dtype=jnp.int32),     # labels
+        jnp.array(elem[3], dtype=jnp.int32),     # label_lengths
+    )
+
+
+# Prime: transfer the first batch before the loop starts.
+cur_audios, cur_frames, cur_labels, cur_label_lengths = _to_jax(next(train_iter))
+
 for epoch in range(args.num_epochs):
     train_loss_sum = 0.0
     train_steps = 0
 
     pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch + 1}/{args.num_epochs}")
     for _ in pbar:
-        element = next(train_iter)
-        padded_audios, frames, padded_labels, label_lengths = element
-        padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
-        padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
-        frames = jnp.array(frames, dtype=jnp.int32)
-        label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
-
+        # 1. Dispatch — non-blocking, GPU starts immediately.
         loss, finite_ratio, grad_finite, model_state, optimizer_state = train_step(
             model_graphdef,
             model_state,
             optimizer_graphdef,
             optimizer_state,
             loss_scale,
-            padded_audios,
-            padded_labels,
-            frames,
-            label_lengths,
+            cur_audios,
+            cur_labels,
+            cur_frames,
+            cur_label_lengths,
         )
 
-        # Update adaptive loss scale (replicates DynamicScale update rule)
-        if grad_finite:
-            scale_fin_steps += 1
-            if scale_fin_steps >= SCALE_GROWTH_INTERVAL:
-                loss_scale = jnp.minimum(
-                    loss_scale * SCALE_GROWTH_FACTOR, jnp.array(2**24, jnp.float32)
-                )
-                scale_fin_steps = jnp.array(0, dtype=jnp.int32)
-        else:
-            loss_scale = jnp.maximum(
-                loss_scale * SCALE_BACKOFF_FACTOR, jnp.array(1.0, jnp.float32)
-            )
-            scale_fin_steps = jnp.array(0, dtype=jnp.int32)
+        # 2. While GPU runs, fetch + queue H2D transfer for the next batch.
+        #    This overlaps with the dispatched step above.
+        cur_audios, cur_frames, cur_labels, cur_label_lengths = _to_jax(next(train_iter))
+
+        # Update adaptive loss scale on-device (no CPU sync).
+        loss_scale, scale_fin_steps = update_loss_scale(loss_scale, scale_fin_steps, grad_finite)
 
         train_loss_sum += float(loss)
         train_steps += 1

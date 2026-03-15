@@ -93,9 +93,7 @@ class FastConformerMHSA(nnx.Module):
         if mask is not None:
             scores = jnp.where(mask, scores, jnp.finfo(jnp.float32).min / 2)
 
-        scores_max = jnp.max(scores, axis=-1, keepdims=True)
-        exp_scores = jnp.exp(scores - scores_max)
-        attn = exp_scores / (jnp.sum(exp_scores, axis=-1, keepdims=True) + 1e-6)
+        attn = jax.nn.softmax(scores, axis=-1)
         attn = self.drop(attn, deterministic=not training)
 
         out = jnp.einsum("bhts,bshd->bthd", attn, v.astype(jnp.float32)).reshape(B, T, D).astype(q.dtype)
