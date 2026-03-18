@@ -165,7 +165,7 @@ class FastConformerEncoder(nnx.Module):
         if rngs is None:
             rngs = nnx.Rngs(0)
 
-        self.mel_spectogram = AudioToMelSpectrogram(n_mels=d_input, rng=rngs, normalize=True, spec_augment=True, **featurizer_kwargs)
+        self.mel_spectogram = AudioToMelSpectrogram(n_mels=d_input, rng=rngs, normalize=True, spec_augment=True, pitch_shift=True, **featurizer_kwargs)
 
         self.conv_subsampler = Conv2dSubSampler(d_model, rngs, dtype)
         freq_dim = ((d_input - 3) // 2 + 1 - 3) // 2 + 1

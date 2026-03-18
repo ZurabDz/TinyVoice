@@ -84,47 +84,6 @@ model.initialize_weights(jax.random.PRNGKey(0))
 
 accum_steps = args.grad_accumulation_steps
 
-# LR schedule counts in optimizer steps (total_steps / accum_steps)
-lr_schedule = optax.warmup_cosine_decay_schedule(
-    init_value=args.lr_init_value,
-    peak_value=args.lr_peak_value,
-    warmup_steps=args.lr_warmup_steps // accum_steps,
-    decay_steps=args.lr_decay_steps // accum_steps,
-    end_value=args.lr_end_value,
-)
-
-
-# Weight decay mask: apply weight decay only to weights (ndim > 1), not biases (ndim == 1)
-def weight_decay_mask(params):
-    return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
-
-
-# For fp16 training, use tighter gradient clipping
-grad_clip_value = 0.5 if args.dtype == jnp.float16 else 1.0
-inner_optimizer = optax.chain(
-    # Clip by value first to prevent extreme gradients in fp16
-    optax.clip(grad_clip_value),
-    optax.clip_by_global_norm(args.grad_clip),
-    optax.adamw(
-        learning_rate=lr_schedule,
-        b1=0.9,
-        b2=0.98,
-        eps=1e-7,
-        weight_decay=args.weight_decay,
-        mask=weight_decay_mask,
-    ),
-)
-
-if accum_steps > 1:
-    tx = optax.MultiSteps(inner_optimizer, every_k_schedule=accum_steps)
-else:
-    tx = inner_optimizer
-
-optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
-
-# Adaptive loss scale state (replicates DynamicScale defaults)
-loss_scale = jnp.array(2**15, dtype=jnp.float32)
-scale_fin_steps = jnp.array(0, dtype=jnp.int32)
 SCALE_GROWTH_INTERVAL = 2000
 
 
@@ -169,9 +128,53 @@ total_steps = steps_per_epoch * args.num_epochs
 print(
     f"Filtered train samples: {len(map_train_audio_dataset)}, steps/epoch: {steps_per_epoch}, total steps: {total_steps}"
 )
-print(
-    f"LR decay_steps (config): {args.lr_decay_steps}, should be close to total steps ({total_steps})"
+
+# Auto-align lr_decay_steps to actual training length so the cosine decay reaches
+# lr_end_value exactly at the final step rather than flatlining early.
+args.lr_decay_steps = total_steps
+print(f"lr_decay_steps auto-set to {args.lr_decay_steps}")
+
+# LR schedule counts in optimizer steps (total_steps / accum_steps)
+lr_schedule = optax.warmup_cosine_decay_schedule(
+    init_value=args.lr_init_value,
+    peak_value=args.lr_peak_value,
+    warmup_steps=args.lr_warmup_steps // accum_steps,
+    decay_steps=args.lr_decay_steps // accum_steps,
+    end_value=args.lr_end_value,
 )
+
+
+# Weight decay mask: apply weight decay only to weights (ndim > 1), not biases (ndim == 1)
+def weight_decay_mask(params):
+    return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
+
+
+# For fp16 training, use tighter gradient clipping
+grad_clip_value = 0.5 if args.dtype == jnp.float16 else 1.0
+inner_optimizer = optax.chain(
+    # Clip by value first to prevent extreme gradients in fp16
+    optax.clip(grad_clip_value),
+    optax.clip_by_global_norm(args.grad_clip),
+    optax.adamw(
+        learning_rate=lr_schedule,
+        b1=0.9,
+        b2=0.98,
+        eps=1e-7,
+        weight_decay=args.weight_decay,
+        mask=weight_decay_mask,
+    ),
+)
+
+if accum_steps > 1:
+    tx = optax.MultiSteps(inner_optimizer, every_k_schedule=accum_steps)
+else:
+    tx = inner_optimizer
+
+optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+# Adaptive loss scale state (replicates DynamicScale defaults)
+loss_scale = jnp.array(2**15, dtype=jnp.float32)
+scale_fin_steps = jnp.array(0, dtype=jnp.int32)
 
 processed_test_dataset = build_test_loader(map_test_audio_dataset, tokenizer, args)
 
@@ -219,8 +222,7 @@ def train_step(
             jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
         ).astype(jnp.float32)
 
-        # Clip logits for fp16 stability to prevent NaN in CTC loss
-        logits_f32 = jnp.clip(logits.astype(jnp.float32), -50.0, 50.0)
+        logits_f32 = logits.astype(jnp.float32)
         per_sample_loss = optax.ctc_loss(
             logits_f32,
             logit_paddings,
@@ -257,7 +259,20 @@ def train_step(
     _, new_model_state = nnx.split(model)
     _, new_optimizer_state = nnx.split(optimizer)
 
-    return loss, finite_loss_ratio, grad_finite, new_model_state, new_optimizer_state
+    # Restore old state if gradients were non-finite — prevents Adam moments
+    # and weight decay from being applied on a zero-gradient step.
+    final_model_state = jax.tree.map(
+        lambda new, old: jnp.where(grad_finite, new, old),
+        new_model_state,
+        model_state,
+    )
+    final_optimizer_state = jax.tree.map(
+        lambda new, old: jnp.where(grad_finite, new, old),
+        new_optimizer_state,
+        optimizer_state,
+    )
+
+    return loss, finite_loss_ratio, grad_finite, final_model_state, final_optimizer_state
 
 
 @jax.jit(static_argnums=(0,))
@@ -281,8 +296,7 @@ def eval_step(
         jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
     ).astype(jnp.float32)
 
-    # Clip logits for fp16 stability to prevent NaN in CTC loss
-    logits_f32 = jnp.clip(logits.astype(jnp.float32), -50.0, 50.0)
+    logits_f32 = logits.astype(jnp.float32)
     per_sample_loss = optax.ctc_loss(
         logits_f32,
         logit_paddings,
@@ -290,9 +304,11 @@ def eval_step(
         label_paddings,
         blank_id=tokenizer.blank_id,
     )
-    per_sample_loss = jnp.where(jnp.isfinite(per_sample_loss), per_sample_loss, 0.0)
+    is_finite = jnp.isfinite(per_sample_loss)
+    finite_ratio = is_finite.mean()
+    finite_loss = jnp.where(is_finite, per_sample_loss, 0.0).sum() / jnp.maximum(is_finite.sum(), 1)
 
-    return per_sample_loss.mean(), logits, real_times
+    return finite_loss, finite_ratio, logits, real_times
 
 
 # Initial Split
@@ -412,6 +428,7 @@ for epoch in range(args.num_epochs):
     # Validation after each epoch
     print(f"\nRunning validation after epoch {epoch + 1}...")
     val_loss_sum = 0.0
+    val_finite_ratio_sum = 0.0
     val_steps = 0
     val_cer_dist = 0
     val_cer_len = 0
@@ -424,7 +441,7 @@ for epoch in range(args.num_epochs):
         frames = jnp.array(frames, dtype=jnp.int32)
         label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
 
-        val_loss, logits, out_lengths = eval_step(
+        val_loss, val_finite_ratio, logits, out_lengths = eval_step(
             model_graphdef,
             model_state,
             padded_audios,
@@ -433,6 +450,7 @@ for epoch in range(args.num_epochs):
             label_lengths,
         )
         val_loss_sum += float(val_loss)
+        val_finite_ratio_sum += float(val_finite_ratio)
         val_steps += 1
 
         # Greedy CTC decode for CER
@@ -451,15 +469,17 @@ for epoch in range(args.num_epochs):
             val_cer_len += len(reference)
 
     avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else 0.0
+    avg_val_finite_ratio = val_finite_ratio_sum / val_steps if val_steps > 0 else 0.0
     val_cer = val_cer_dist / max(val_cer_len, 1)
     avg_epoch_train_loss = train_loss_sum / train_steps
     print(
-        f"Epoch {epoch + 1} - Train Loss: {avg_epoch_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val CER: {val_cer:.4f}\n"
+        f"Epoch {epoch + 1} - Train Loss: {avg_epoch_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val CER: {val_cer:.4f}, Val Finite: {avg_val_finite_ratio:.4f}\n"
     )
     with tb_writer.as_default():
         tf.summary.scalar("epoch/train_loss", avg_epoch_train_loss, step=global_step)
         tf.summary.scalar("epoch/val_loss", avg_val_loss, step=global_step)
         tf.summary.scalar("epoch/val_cer", val_cer, step=global_step)
+        tf.summary.scalar("epoch/val_finite_ratio", avg_val_finite_ratio, step=global_step)
 
     if DEV_MODE and global_step >= DEV_STEPS:
         break

@@ -8,6 +8,7 @@ from pathlib import Path
 import io
 import soundfile as sf
 import librosa
+from scipy.signal import fftconvolve
 
 
 def pack_speech_data(audio_bytes, metadata):
@@ -107,6 +108,28 @@ class AddNoise(grain.transforms.RandomMap):
         return element
 
 
+class AddReverb(grain.transforms.RandomMap):
+    """Simulate room reverberation via synthetic exponential-decay RIR."""
+    def __init__(self, sample_rate=16000, rt60_range=(0.1, 0.6), prob=0.3):
+        self.sample_rate = sample_rate
+        self.rt60_min, self.rt60_max = rt60_range
+        self.prob = prob
+
+    def random_map(self, element, rng: np.random.Generator):
+        if rng.random() < self.prob:
+            audio = element["audio"]
+            rt60 = rng.uniform(self.rt60_min, self.rt60_max)
+            # Exponential decay: h[n] = exp(-6.9 * n / (rt60 * sr))
+            rir_len = int(rt60 * self.sample_rate)
+            t = np.arange(rir_len, dtype=np.float32)
+            h = np.exp(-6.9 * t / (rt60 * self.sample_rate))
+            h /= h.sum()  # normalize energy
+            convolved = fftconvolve(audio, h, mode="full")[:len(audio)]
+            element["audio"] = convolved.astype(np.float32)
+        return element
+
+
+
 def build_data_sources(data_dir: str, sampling_rate: int, batch_size: int):
     """Create filtered map datasets for train and test splits."""
     train_source = grain.sources.ArrayRecordDataSource(
@@ -115,7 +138,7 @@ def build_data_sources(data_dir: str, sampling_rate: int, batch_size: int):
     test_source = grain.sources.ArrayRecordDataSource(
         data_dir + "/packed_dataset/test.array_record"
     )
-    duration_filter = FilterByDuration(sample_rate=sampling_rate, min_sec=1, max_sec=12.0)
+    duration_filter = FilterByDuration(sample_rate=sampling_rate, min_sec=1, max_sec=11.0)
     map_train = grain.MapDataset.source(train_source).filter(duration_filter)
     map_test = grain.MapDataset.source(test_source).filter(duration_filter)
     steps_per_epoch = len(map_train) // batch_size
@@ -136,6 +159,7 @@ def build_train_loader(map_train: grain.MapDataset, tokenizer, args, n_epoch: in
         .map(ProcessAudioData(tokenizer))
         .random_map(SpeedPerturb(sample_rate=args.sampling_rate), seed=42)
         .random_map(AddNoise(), seed=42)
+        .random_map(AddReverb(sample_rate=args.sampling_rate), seed=42)
         .to_iter_dataset(read_options=read_options)
         .batch(
             batch_size=args.batch_size,

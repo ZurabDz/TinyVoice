@@ -6,6 +6,75 @@ import jax.numpy as jnp
 from jax.scipy.signal import stft
 
 
+def pitch_shift_mel(mel_specs, rng, semitones=2.0, prob=0.3, f_min=0.0, f_max=8000.0):
+    """Pitch-shift mel spectrograms via frequency-bin interpolation.
+
+    For each item in the batch, samples a random semitone shift in
+    [-semitones, +semitones] with probability ``prob``, then remaps each
+    destination bin k to its correct source bin via the exact mel-scale
+    inversion:  src_bin = mel_bin(dest_freq / alpha).
+
+    This runs entirely in JAX (vmapped over the batch), so it executes on
+    device inside the JIT-compiled training step with no CPU overhead.
+
+    Args:
+        mel_specs: [B, n_mels, T] mel spectrogram (any dtype).
+        rng: JAX random key.
+        semitones: maximum shift magnitude in semitones.
+        prob: per-sample application probability.
+        f_min: lower frequency bound used when building the mel filterbank.
+        f_max: upper frequency bound used when building the mel filterbank.
+
+    Returns:
+        mel_specs of the same shape and dtype with pitch shifts applied.
+    """
+    batch_size, n_mels, _ = mel_specs.shape
+    orig_dtype = mel_specs.dtype
+    # Compute in float32 for numerical stability
+    x = mel_specs.astype(jnp.float32)
+
+    rng, apply_key, shift_key = jax.random.split(rng, 3)
+    apply_mask = jax.random.uniform(apply_key, (batch_size,)) < prob
+    n_steps = jax.random.uniform(
+        shift_key, (batch_size,), minval=-semitones, maxval=semitones
+    )
+
+    # Precompute mel-scale constants (scalar Python floats → traced as constants)
+    mel_min = jnp.float32(2595.0 * math.log10(1.0 + f_min / 700.0))
+    mel_max = jnp.float32(2595.0 * math.log10(1.0 + f_max / 700.0))
+    log10 = jnp.float32(math.log(10.0))
+    bin_idx = jnp.arange(n_mels, dtype=jnp.float32)
+
+    def shift_one(mel_item, n_shift, apply):
+        alpha = jnp.float32(2.0) ** (n_shift / 12.0)
+
+        # Mel values at each destination bin centre
+        dest_mels = mel_min + bin_idx / (n_mels - 1) * (mel_max - mel_min)
+        # Corresponding frequencies (mel → Hz)
+        dest_freqs = 700.0 * (jnp.exp(dest_mels / 2595.0 * log10) - 1.0)
+        # Source frequency: pitch shift is a frequency scaling
+        src_freqs = dest_freqs / alpha
+        # Bins whose source frequency falls outside [f_min, f_max] are zeroed
+        valid = (src_freqs >= f_min) & (src_freqs <= f_max)
+        src_freqs_c = jnp.clip(src_freqs, f_min, f_max)
+        # Source frequencies back to mel-bin indices (Hz → mel → bin)
+        src_mels = 2595.0 * jnp.log(src_freqs_c / 700.0 + 1.0) / log10
+        src_bins = (src_mels - mel_min) / (mel_max - mel_min) * (n_mels - 1)
+
+        # Linear interpolation over the mel axis for all T frames simultaneously
+        floor_b = jnp.clip(jnp.floor(src_bins).astype(jnp.int32), 0, n_mels - 2)
+        frac = (src_bins - floor_b.astype(jnp.float32))[:, None]  # [n_mels, 1]
+        low = mel_item[floor_b, :]        # [n_mels, T]
+        high = mel_item[floor_b + 1, :]   # [n_mels, T]
+        shifted = low + frac * (high - low)
+        shifted = jnp.where(valid[:, None], shifted, 0.0)
+
+        return jnp.where(apply, shifted, mel_item)
+
+    result = jax.vmap(shift_one)(x, n_steps, apply_mask)
+    return result.astype(orig_dtype)
+
+
 def normalize_batch(x, seq_len):
     constant = 1e-5
     batch_size, num_features, max_time = x.shape
@@ -49,9 +118,9 @@ def spec_augment(
     seq_len,
     rng,
     n_freq_masks=2,
-    n_time_masks=5,
+    n_time_masks=10,
     freq_mask_param=27,
-    time_mask_ratio=0.10,
+    time_mask_ratio=0.05,
 ):
     """SpecAugment: Time and Frequency Masking.
 
@@ -109,6 +178,9 @@ class AudioToMelSpectrogram(nnx.Module):
         rng=None,
         normalize=False,
         spec_augment=False,
+        pitch_shift=False,
+        pitch_shift_semitones=2.0,
+        pitch_shift_prob=0.3,
     ):
         self.rngs = rng if rng else nnx.Rngs(0)
         self.sample_rate = sample_rate
@@ -119,6 +191,9 @@ class AudioToMelSpectrogram(nnx.Module):
         self.pad_value = 0
         self.normalize = normalize
         self.spec_augment = spec_augment
+        self.pitch_shift = pitch_shift
+        self.pitch_shift_semitones = pitch_shift_semitones
+        self.pitch_shift_prob = pitch_shift_prob
 
         self.log_zero_guard_value = 2**-24
 
@@ -164,6 +239,16 @@ class AudioToMelSpectrogram(nnx.Module):
 
         if self.normalize:
             x, _, _ = normalize_batch(x, seq_len)
+
+        if self.pitch_shift and training:
+            x = pitch_shift_mel(
+                x,
+                self.rngs.dropout(),
+                semitones=self.pitch_shift_semitones,
+                prob=self.pitch_shift_prob,
+                f_min=0.0,
+                f_max=self.sample_rate / 2,
+            )
 
         if self.spec_augment and training:
             # We use nnx.Rngs to get a fresh key for each call
