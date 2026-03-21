@@ -72,6 +72,7 @@ model = FastConformerEncoder(
     feed_forward_expansion_factor=args.feed_forward_expansion_factor,
     conv_kernel_size=args.conv_kernel_size,
     layer_drop_prob=args.layer_drop_prob,
+    layer_drop_anneal_steps=args.layer_drop_anneal_steps,
     d_input=args.n_mels,
     sample_rate=args.sampling_rate,
     n_fft=args.n_fft,
@@ -207,13 +208,14 @@ def train_step(
     padded_labels,
     frames,
     label_lengths,
+    step,
 ):
     """Training step using Functional API"""
     model = nnx.merge(model_graphdef, model_state)
     optimizer = nnx.merge(optimizer_graphdef, optimizer_state)
 
     def loss_fn(model):
-        logits, real_times = model(padded_audios, training=True, inputs_lengths=frames)
+        logits, real_times = model(padded_audios, training=True, inputs_lengths=frames, step=step)
 
         logit_paddings = (jnp.arange(logits.shape[1]) >= real_times[:, None]).astype(
             jnp.float32
@@ -235,7 +237,23 @@ def train_step(
 
         # Zero out infinite CTC losses (e.g. from impossible alignments)
         per_sample_loss = jnp.where(is_finite, per_sample_loss, 0.0)
-        return per_sample_loss.mean(), finite_loss_ratio
+        ctc_loss = per_sample_loss.mean()
+
+        # Entropy regularization: prevent over-confident peaky CTC distributions
+        # Wrapped in remat to avoid storing softmax activations during backprop
+        frame_mask = (1.0 - logit_paddings)  # 1 for valid, 0 for padding
+
+        @jax.remat
+        def compute_entropy(logits, mask):
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            probs = jnp.exp(log_probs)
+            ent = -jnp.sum(probs * log_probs, axis=-1)  # (B, T)
+            return (ent * mask).sum() / jnp.maximum(mask.sum(), 1.0)
+
+        masked_entropy = compute_entropy(logits_f32, frame_mask)
+
+        loss = ctc_loss - args.entropy_weight * masked_entropy
+        return loss, finite_loss_ratio
 
     def scaled_loss_fn(model):
         loss, aux = loss_fn(model)
@@ -340,6 +358,7 @@ if not DEV_MODE:
             d_labels,
             d_frames,
             d_label_lengths,
+            jnp.int32(0),  # step
         ).compile()
         print(f"Compiled bucket: audio_frames={b_frames}, label_len={b_label}")
 
@@ -442,6 +461,7 @@ for epoch in range(args.num_epochs):
             cur_labels,
             cur_frames,
             cur_label_lengths,
+            jnp.int32(global_step),
         )
 
         # 2. While GPU runs, fetch the next batch from the prefetch queue.

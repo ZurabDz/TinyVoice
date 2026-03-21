@@ -124,16 +124,17 @@ class FastConformerConvModule(nnx.Module):
 
 
 class FastConformerBlock(nnx.Module):
-    def __init__(self, d_model, num_heads, expansion, conv_kernel, dropout, drop_prob, rngs, dtype=jnp.float32):
+    def __init__(self, d_model, num_heads, expansion, conv_kernel, dropout, drop_prob, rngs, dtype=jnp.float32, drop_anneal_steps=5000):
         self.ff1 = FastConformerFFN(d_model, expansion, dropout, rngs, dtype)
         self.attn = FastConformerMHSA(d_model, num_heads, dropout, rngs, dtype)
         self.conv = FastConformerConvModule(d_model, conv_kernel, dropout, rngs, dtype)
         self.ff2 = FastConformerFFN(d_model, expansion, dropout, rngs, dtype)
         self.norm = nnx.LayerNorm(d_model, rngs=rngs)
         self.drop_prob = drop_prob
+        self.drop_anneal_steps = drop_anneal_steps
         self.rngs = rngs
 
-    def __call__(self, x, mask=None, training=True):
+    def __call__(self, x, mask=None, training=True, step=None):
         x_in = x
         x = self.ff1(x, training=training)
         x = self.attn(x, mask=mask, training=training)
@@ -141,7 +142,10 @@ class FastConformerBlock(nnx.Module):
         x = self.ff2(x, training=training)
         x = self.norm(x)
         if training and self.drop_prob > 0.0:
-            keep = jax.random.bernoulli(self.rngs.dropout(), 1.0 - self.drop_prob)
+            drop_prob = self.drop_prob
+            if step is not None:
+                drop_prob = self.drop_prob * jnp.minimum(step / float(self.drop_anneal_steps), 1.0)
+            keep = jax.random.bernoulli(self.rngs.dropout(), 1.0 - drop_prob)
             return jnp.where(keep, x, x_in)
         return x
 
@@ -160,6 +164,7 @@ class FastConformerEncoder(nnx.Module):
         layer_drop_prob=0.1,
         rngs=None,
         dtype=jnp.float32,
+        layer_drop_anneal_steps=5000,
         **featurizer_kwargs,
     ):
         if rngs is None:
@@ -172,7 +177,7 @@ class FastConformerEncoder(nnx.Module):
         self.linear_proj = nnx.Linear(d_model * freq_dim, d_model, rngs=rngs, dtype=dtype)
 
         self.layers = nnx.List([
-            FastConformerBlock(d_model, num_head, feed_forward_expansion_factor, conv_kernel_size, dropout, layer_drop_prob, rngs, dtype)
+            FastConformerBlock(d_model, num_head, feed_forward_expansion_factor, conv_kernel_size, dropout, layer_drop_prob, rngs, dtype, drop_anneal_steps=layer_drop_anneal_steps)
             for _ in range(num_layers)
         ])
         self.decoder = nnx.Linear(d_model, token_count, rngs=rngs, dtype=dtype)
@@ -181,7 +186,7 @@ class FastConformerEncoder(nnx.Module):
     def compute_mask(self, lengths, max_length):
         return (jnp.arange(max_length)[None, :] < lengths[:, None])[:, None, None, :]
 
-    def __call__(self, x, mask=None, training=True, inputs_lengths=None):
+    def __call__(self, x, mask=None, training=True, inputs_lengths=None, step=None):
         x, seq_len = self.mel_spectogram(x, lengths=inputs_lengths, training=training)
         x = jnp.transpose(x, (0, 2, 1))
 
@@ -195,7 +200,7 @@ class FastConformerEncoder(nnx.Module):
             mask = self.compute_mask(seq_len, x.shape[1])
 
         for layer in self.layers:
-            x = layer(x, mask, training=training)
+            x = layer(x, mask, training=training, step=step)
 
         return self.decoder(x), seq_len
 

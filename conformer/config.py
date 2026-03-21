@@ -2,21 +2,27 @@ from dataclasses import dataclass, field
 import jax.numpy as jnp
 
 
+def _round_up_to_multiple(x, m):
+    return ((x + m - 1) // m) * m
+
+
 def _default_buckets():
     # Bucket sizes: (audio_frames, label_length)
     # Ensure audio_frames >= label_length * 704 (approx subsampling factor 640 + 10% margin)
     # Subsampling: hop_length=160 * conv_stride=4 = 640
+    # All dimensions padded to multiples of 8 for XLA vectorization
     raw_buckets = [
         (67040,  94),
         (87520,  120),
         (128480, 154),
         (176000, 200),
     ]
-    # Adjust audio_frames to be at least label_length * 704
     adjusted = []
     for audio_frames, label_len in raw_buckets:
+        label_len = _round_up_to_multiple(label_len, 8)
         min_audio = int(label_len * 704)
-        adjusted.append((max(audio_frames, min_audio), label_len))
+        audio_frames = _round_up_to_multiple(max(audio_frames, min_audio), 8)
+        adjusted.append((audio_frames, label_len))
     return adjusted
 
 
@@ -54,6 +60,8 @@ class TrainingArguments:
     conv_kernel_size: int = 9
     subsampling_factor: int = 4
     layer_drop_prob: float = 0.1
+    layer_drop_anneal_steps: int = 5000
+    entropy_weight: float = 0.1
 
     sampling_rate: int = 16000
     n_fft: int = 512
