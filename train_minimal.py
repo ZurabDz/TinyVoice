@@ -5,7 +5,7 @@ import tensorflow as tf
 tf.config.set_visible_devices([], "GPU")
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.98"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 os.environ["XLA_FLAGS"] = (
     "--xla_gpu_enable_command_buffer= "
@@ -44,6 +44,8 @@ from tqdm.auto import tqdm
 
 DEV_MODE = os.environ.get("TINYVOICE_DEV", "0") == "1"
 DEV_STEPS = int(os.environ.get("TINYVOICE_DEV_STEPS", "10000"))
+PROFILE_START_STEP = int(os.environ.get("TINYVOICE_PROFILE_START", "0"))
+PROFILE_STEPS = int(os.environ.get("TINYVOICE_PROFILE_STEPS", "0"))
 
 args = TrainingArguments()
 if DEV_MODE:
@@ -87,25 +89,6 @@ accum_steps = args.grad_accumulation_steps
 
 SCALE_GROWTH_INTERVAL = 2000
 
-
-@jax.jit
-def update_loss_scale(loss_scale, scale_fin_steps, grad_finite):
-    """Update loss scale on-device — no CPU sync required."""
-    def on_finite(args):
-        ls, sfs = args
-        new_sfs = sfs + jnp.int32(1)
-        new_ls, new_sfs = jax.lax.cond(
-            new_sfs >= SCALE_GROWTH_INTERVAL,
-            lambda: (jnp.minimum(ls * jnp.float32(2.0), jnp.float32(2**24)), jnp.int32(0)),
-            lambda: (ls, new_sfs),
-        )
-        return new_ls, new_sfs
-
-    def on_infinite(args):
-        ls, _ = args
-        return jnp.maximum(ls * jnp.float32(0.5), jnp.float32(1.0)), jnp.int32(0)
-
-    return jax.lax.cond(grad_finite, on_finite, on_infinite, (loss_scale, scale_fin_steps))
 
 import tensorflow as tf
 import orbax.checkpoint as ocp
@@ -204,6 +187,7 @@ def train_step(
     optimizer_graphdef,
     optimizer_state,
     loss_scale,
+    scale_fin_steps,
     padded_audios,
     padded_labels,
     frames,
@@ -290,7 +274,26 @@ def train_step(
         optimizer_state,
     )
 
-    return loss, finite_loss_ratio, grad_finite, final_model_state, final_optimizer_state
+    # Update loss scale inline (avoids separate JIT dispatch round-trip)
+    def _on_finite(args):
+        ls, sfs = args
+        new_sfs = sfs + jnp.int32(1)
+        new_ls, new_sfs = jax.lax.cond(
+            new_sfs >= SCALE_GROWTH_INTERVAL,
+            lambda: (jnp.minimum(ls * jnp.float32(2.0), jnp.float32(2**24)), jnp.int32(0)),
+            lambda: (ls, new_sfs),
+        )
+        return new_ls, new_sfs
+
+    def _on_infinite(args):
+        ls, _ = args
+        return jnp.maximum(ls * jnp.float32(0.5), jnp.float32(1.0)), jnp.int32(0)
+
+    new_loss_scale, new_scale_fin_steps = jax.lax.cond(
+        grad_finite, _on_finite, _on_infinite, (loss_scale, scale_fin_steps)
+    )
+
+    return loss, finite_loss_ratio, grad_finite, final_model_state, final_optimizer_state, new_loss_scale, new_scale_fin_steps
 
 
 @jax.jit(static_argnums=(0,))
@@ -354,6 +357,7 @@ if not DEV_MODE:
             optimizer_graphdef,
             abstract_optimizer_state,
             loss_scale,
+            scale_fin_steps,
             d_audios,
             d_labels,
             d_frames,
@@ -436,7 +440,7 @@ class PrefetchIterator:
 # Wrap the original iterator with prefetching
 # Note: we recreate the iterator to ensure clean state if needed,
 # though here we just wrap the existing one.
-prefetch_iter = PrefetchIterator(iter(processed_train_dataset), _to_jax)
+prefetch_iter = PrefetchIterator(iter(processed_train_dataset), _to_jax, buffer_size=8)
 
 # Prime: fetch the first batch (this will block until the worker produces one)
 try:
@@ -445,24 +449,34 @@ except StopIteration:
     raise RuntimeError("Dataset is empty!")
 
 for epoch in range(args.num_epochs):
-    train_loss_sum = 0.0
+    train_loss_sum = jnp.float32(0.0)
     train_steps = 0
 
     pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch + 1}/{args.num_epochs}")
     for _ in pbar:
+        # Start profiler trace at configured step
+        if PROFILE_STEPS > 0 and global_step == PROFILE_START_STEP:
+            jax.profiler.start_trace("./runs/profile")
+
         # 1. Dispatch — non-blocking, GPU starts immediately.
-        loss, finite_ratio, grad_finite, model_state, optimizer_state = train_step(
+        loss, finite_ratio, grad_finite, model_state, optimizer_state, loss_scale, scale_fin_steps = train_step(
             model_graphdef,
             model_state,
             optimizer_graphdef,
             optimizer_state,
             loss_scale,
+            scale_fin_steps,
             cur_audios,
             cur_labels,
             cur_frames,
             cur_label_lengths,
             jnp.int32(global_step),
         )
+
+        # Stop profiler trace after configured number of steps
+        if PROFILE_STEPS > 0 and global_step == PROFILE_START_STEP + PROFILE_STEPS:
+            loss.block_until_ready()
+            jax.profiler.stop_trace()
 
         # 2. While GPU runs, fetch the next batch from the prefetch queue.
         #    The worker thread has likely already prepared this.
@@ -472,10 +486,7 @@ for epoch in range(args.num_epochs):
             # Should not happen with .repeat(), but safe to handle
             break
 
-        # Update adaptive loss scale on-device (no CPU sync).
-        loss_scale, scale_fin_steps = update_loss_scale(loss_scale, scale_fin_steps, grad_finite)
-
-        train_loss_sum += float(loss)
+        train_loss_sum = train_loss_sum + loss  # accumulate on-device, no CPU sync
         train_steps += 1
         global_step += 1
 
@@ -491,8 +502,8 @@ for epoch in range(args.num_epochs):
                 ),
             )
 
-        if global_step % 5 == 0 or global_step < 10:
-            avg_train_loss = train_loss_sum / train_steps
+        if global_step % args.log_steps == 0 or global_step < 10:
+            avg_train_loss = float(train_loss_sum) / train_steps  # single CPU sync
             pbar.set_postfix(
                 {
                     "loss": f"{avg_train_loss:.4f}",

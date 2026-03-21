@@ -7,8 +7,8 @@ import numpy as np
 
 class Conv2dSubSampler(nnx.Module):
     def __init__(self, d_model, rngs: nnx.Rngs, dtype=jnp.float32):
-        self.conv1 = nnx.Conv(1, d_model, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype)
-        self.conv2 = nnx.Conv(d_model, d_model, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype)
+        self.conv1 = nnx.Conv(1, d_model // 4, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype)
+        self.conv2 = nnx.Conv(d_model // 4, d_model, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype)
 
     def get_length(self, seq_len):
         seq_len = (seq_len - 3) // 2 + 1
@@ -89,14 +89,16 @@ class FastConformerMHSA(nnx.Module):
         q, k = apply_rotary_emb(q, k, cos, sin)
 
         # Accumulate in float32 to prevent overflow
-        scores = jnp.einsum("bthd,bshd->bhts", q.astype(jnp.float32), k.astype(jnp.float32)) / jnp.sqrt(d)
+        scores = jnp.einsum("bthd,bshd->bhts", q, k,
+                             preferred_element_type=jnp.float32) / jnp.sqrt(jnp.float32(d))
         if mask is not None:
             scores = jnp.where(mask, scores, jnp.finfo(jnp.float32).min / 2)
 
         attn = jax.nn.softmax(scores, axis=-1)
         attn = self.drop(attn, deterministic=not training)
 
-        out = jnp.einsum("bhts,bshd->bthd", attn, v.astype(jnp.float32)).reshape(B, T, D).astype(q.dtype)
+        out = jnp.einsum("bhts,bshd->bthd", attn, v,
+                          preferred_element_type=jnp.float32).reshape(B, T, D).astype(q.dtype)
         return residual + self.drop(self.out_proj(out), deterministic=not training)
 
 
@@ -193,7 +195,7 @@ class FastConformerEncoder(nnx.Module):
         seq_len = self.conv_subsampler.get_length(seq_len)
         x = self.conv_subsampler(x[:, :, :, None])
         compute_dtype = self.linear_proj.kernel.value.dtype
-        x = self.linear_proj(x.astype(jnp.float32)).astype(compute_dtype)
+        x = self.linear_proj(x).astype(compute_dtype)
         x = x * jnp.sqrt(self.d_model).astype(compute_dtype)
 
         if mask is None and inputs_lengths is not None:

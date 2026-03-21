@@ -51,7 +51,7 @@ class TrainingArguments:
     save_total_limit: int = 5
 
     d_model: int = 256
-    num_encoder_layers: int = 8
+    num_encoder_layers: int = 16
     num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 4
     feed_forward_dropout_p: float = 0.1
