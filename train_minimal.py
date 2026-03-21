@@ -347,7 +347,6 @@ if not DEV_MODE:
 processed_train_dataset = build_train_loader(
     map_train_audio_dataset, tokenizer, args, args.num_epochs
 )
-train_iter = iter(processed_train_dataset)
 global_step = 0
 
 
@@ -361,8 +360,70 @@ def _to_jax(elem):
     )
 
 
-# Prime: transfer the first batch before the loop starts.
-cur_audios, cur_frames, cur_labels, cur_label_lengths = _to_jax(next(train_iter))
+import queue
+import threading
+
+class PrefetchIterator:
+    """Runs data loading and H2D transfer in a background thread."""
+    def __init__(self, iterator, transform_fn, buffer_size=4):
+        self.iterator = iterator
+        self.transform_fn = transform_fn
+        self.queue = queue.Queue(maxsize=buffer_size)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _worker(self):
+        try:
+            for item in self.iterator:
+                if self.stop_event.is_set():
+                    break
+                # Apply transformation (e.g., _to_jax) and queue it
+                # The JAX array creation here happens in the thread, triggering async H2D.
+                try:
+                    transformed = self.transform_fn(item)
+                    self.queue.put(transformed)
+                except Exception as e:
+                    print(f"Prefetch worker error: {e}")
+                    self.queue.put(None)
+                    break
+        except StopIteration:
+            self.queue.put(None)
+        except Exception as e:
+             print(f"Prefetch worker iterator error: {e}")
+             self.queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is None:
+            raise StopIteration
+        return item
+
+    def close(self):
+        self.stop_event.set()
+        # Drain queue to allow worker to exit if stuck in put()
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.thread.join(timeout=1.0)
+
+
+# Wrap the original iterator with prefetching
+# Note: we recreate the iterator to ensure clean state if needed,
+# though here we just wrap the existing one.
+prefetch_iter = PrefetchIterator(iter(processed_train_dataset), _to_jax)
+
+# Prime: fetch the first batch (this will block until the worker produces one)
+try:
+    cur_audios, cur_frames, cur_labels, cur_label_lengths = next(prefetch_iter)
+except StopIteration:
+    raise RuntimeError("Dataset is empty!")
 
 for epoch in range(args.num_epochs):
     train_loss_sum = 0.0
@@ -383,9 +444,13 @@ for epoch in range(args.num_epochs):
             cur_label_lengths,
         )
 
-        # 2. While GPU runs, fetch + queue H2D transfer for the next batch.
-        #    This overlaps with the dispatched step above.
-        cur_audios, cur_frames, cur_labels, cur_label_lengths = _to_jax(next(train_iter))
+        # 2. While GPU runs, fetch the next batch from the prefetch queue.
+        #    The worker thread has likely already prepared this.
+        try:
+            cur_audios, cur_frames, cur_labels, cur_label_lengths = next(prefetch_iter)
+        except StopIteration:
+            # Should not happen with .repeat(), but safe to handle
+            break
 
         # Update adaptive loss scale on-device (no CPU sync).
         loss_scale, scale_fin_steps = update_loss_scale(loss_scale, scale_fin_steps, grad_finite)
