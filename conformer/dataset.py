@@ -99,17 +99,20 @@ class AddNoise(grain.transforms.RandomMap):
     def random_map(self, element, rng: np.random.Generator):
         if rng.random() < self.prob:
             audio = element["audio"]
-            signal_power = np.mean(audio ** 2)
+            signal_power = np.mean(audio**2)
             if signal_power > 0:
                 snr_db = rng.uniform(self.min_snr_db, self.max_snr_db)
                 noise_power = signal_power / (10 ** (snr_db / 10))
-                noise = rng.normal(0, np.sqrt(noise_power), size=audio.shape).astype(np.float32)
+                noise = rng.normal(0, np.sqrt(noise_power), size=audio.shape).astype(
+                    np.float32
+                )
                 element["audio"] = audio + noise
         return element
 
 
 class AddReverb(grain.transforms.RandomMap):
     """Simulate room reverberation via synthetic exponential-decay RIR."""
+
     def __init__(self, sample_rate=16000, rt60_range=(0.1, 0.6), prob=0.3):
         self.sample_rate = sample_rate
         self.rt60_min, self.rt60_max = rt60_range
@@ -124,10 +127,9 @@ class AddReverb(grain.transforms.RandomMap):
             t = np.arange(rir_len, dtype=np.float32)
             h = np.exp(-6.9 * t / (rt60 * self.sample_rate))
             h /= h.sum()  # normalize energy
-            convolved = fftconvolve(audio, h, mode="full")[:len(audio)]
+            convolved = fftconvolve(audio, h, mode="full")[: len(audio)]
             element["audio"] = convolved.astype(np.float32)
         return element
-
 
 
 def build_data_sources(data_dir: str, sampling_rate: int, batch_size: int):
@@ -138,7 +140,9 @@ def build_data_sources(data_dir: str, sampling_rate: int, batch_size: int):
     test_source = grain.sources.ArrayRecordDataSource(
         data_dir + "/packed_dataset/test.array_record"
     )
-    duration_filter = FilterByDuration(sample_rate=sampling_rate, min_sec=1, max_sec=11.0)
+    duration_filter = FilterByDuration(
+        sample_rate=sampling_rate, min_sec=1, max_sec=11.0
+    )
     map_train = grain.MapDataset.source(train_source).filter(duration_filter)
     map_test = grain.MapDataset.source(test_source).filter(duration_filter)
     steps_per_epoch = len(map_train) // batch_size
@@ -196,22 +200,16 @@ def build_test_loader(map_test, tokenizer, args):
 
 def batch_fn(data, bucket_sizes=None, pad_token_id: int = 0):
     batch_size = len(data)
+    # Find the smallest bucket that fits all examples in the batch
+    batch_max_frames = max(len(item["audio"]) for item in data)
+    batch_max_label = max(len(item["label"]) for item in data)
 
-    if bucket_sizes is None:
-        # Default fallback if no buckets provided
-        max_frames = 235008
-        max_label_len = 164
-    else:
-        # Find the smallest bucket that fits all examples in the batch
-        batch_max_frames = max(len(item["audio"]) for item in data)
-        batch_max_label = max(len(item["label"]) for item in data)
-
-        # Default to the largest bucket if none fit (though we should probably handle this better)
-        max_frames, max_label_len = bucket_sizes[-1]
-        for b_frames, b_label in bucket_sizes:
-            if batch_max_frames <= b_frames and batch_max_label <= b_label:
-                max_frames, max_label_len = b_frames, b_label
-                break
+    # Default to the largest bucket if none fit (though we should probably handle this better)
+    max_frames, max_label_len = bucket_sizes[-1]
+    for b_frames, b_label in bucket_sizes:
+        if batch_max_frames <= b_frames and batch_max_label <= b_label:
+            max_frames, max_label_len = b_frames, b_label
+            break
 
     padded_audios = np.zeros((batch_size, max_frames), dtype=np.float32)
     padded_labels = np.full((batch_size, max_label_len), pad_token_id, dtype=np.int32)

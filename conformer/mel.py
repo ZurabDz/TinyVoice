@@ -64,8 +64,8 @@ def pitch_shift_mel(mel_specs, rng, semitones=2.0, prob=0.3, f_min=0.0, f_max=80
         # Linear interpolation over the mel axis for all T frames simultaneously
         floor_b = jnp.clip(jnp.floor(src_bins).astype(jnp.int32), 0, n_mels - 2)
         frac = (src_bins - floor_b.astype(jnp.float32))[:, None]  # [n_mels, 1]
-        low = mel_item[floor_b, :]        # [n_mels, T]
-        high = mel_item[floor_b + 1, :]   # [n_mels, T]
+        low = mel_item[floor_b, :]  # [n_mels, T]
+        high = mel_item[floor_b + 1, :]  # [n_mels, T]
         shifted = low + frac * (high - low)
         shifted = jnp.where(valid[:, None], shifted, 0.0)
 
@@ -78,7 +78,7 @@ def pitch_shift_mel(mel_specs, rng, semitones=2.0, prob=0.3, f_min=0.0, f_max=80
 def normalize_batch(x, seq_len):
     constant = 1e-5
     batch_size, num_features, max_time = x.shape
-    
+
     # Cast to float32 for stable statistics computation in fp16 training
     compute_dtype = x.dtype
     if compute_dtype == jnp.float16:
@@ -103,7 +103,7 @@ def normalize_batch(x, seq_len):
     x_std = x_std + constant
 
     normalized_x = (x - x_mean[:, :, None]) / x_std[:, :, None]
-    
+
     # Cast back to original dtype if needed
     if compute_dtype == jnp.float16:
         normalized_x = normalized_x.astype(compute_dtype)

@@ -7,8 +7,24 @@ import numpy as np
 
 class Conv2dSubSampler(nnx.Module):
     def __init__(self, d_model, rngs: nnx.Rngs, dtype=jnp.float32):
-        self.conv1 = nnx.Conv(1, d_model // 4, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype)
-        self.conv2 = nnx.Conv(d_model // 4, d_model, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype)
+        self.conv1 = nnx.Conv(
+            1,
+            d_model // 4,
+            (3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            rngs=rngs,
+            dtype=dtype,
+        )
+        self.conv2 = nnx.Conv(
+            d_model // 4,
+            d_model,
+            (3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            rngs=rngs,
+            dtype=dtype,
+        )
 
     def get_length(self, seq_len):
         seq_len = (seq_len - 3) // 2 + 1
@@ -69,8 +85,12 @@ class FastConformerMHSA(nnx.Module):
         self.head_dim = d_model // num_heads
         self.norm = nnx.LayerNorm(d_model, rngs=rngs)
         self.q_proj = nnx.Linear(d_model, d_model, rngs=rngs, dtype=dtype)
-        self.k_proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
-        self.v_proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.k_proj = nnx.Linear(
+            d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype
+        )
+        self.v_proj = nnx.Linear(
+            d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype
+        )
         self.out_proj = nnx.Linear(d_model, d_model, rngs=rngs, dtype=dtype)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
         self.rope = RotaryEmbedding(self.head_dim)
@@ -89,24 +109,38 @@ class FastConformerMHSA(nnx.Module):
         q, k = apply_rotary_emb(q, k, cos, sin)
 
         # Accumulate in float32 to prevent overflow
-        scores = jnp.einsum("bthd,bshd->bhts", q, k,
-                             preferred_element_type=jnp.float32) / jnp.sqrt(jnp.float32(d))
+        scores = jnp.einsum(
+            "bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32
+        ) / jnp.sqrt(jnp.float32(d))
         if mask is not None:
             scores = jnp.where(mask, scores, jnp.finfo(jnp.float32).min / 2)
 
         attn = jax.nn.softmax(scores, axis=-1)
         attn = self.drop(attn, deterministic=not training)
 
-        out = jnp.einsum("bhts,bshd->bthd", attn, v,
-                          preferred_element_type=jnp.float32).reshape(B, T, D).astype(q.dtype)
+        out = (
+            jnp.einsum("bhts,bshd->bthd", attn, v, preferred_element_type=jnp.float32)
+            .reshape(B, T, D)
+            .astype(q.dtype)
+        )
         return residual + self.drop(self.out_proj(out), deterministic=not training)
 
 
 class FastConformerConvModule(nnx.Module):
-    def __init__(self, d_model, kernel_size, dropout, rngs: nnx.Rngs, dtype=jnp.float32):
+    def __init__(
+        self, d_model, kernel_size, dropout, rngs: nnx.Rngs, dtype=jnp.float32
+    ):
         self.norm = nnx.LayerNorm(d_model, rngs=rngs)
         self.pw1 = nnx.Conv(d_model, d_model * 2, (1,), rngs=rngs, dtype=dtype)
-        self.dw = nnx.Conv(d_model, d_model, (kernel_size,), feature_group_count=d_model, padding="SAME", rngs=rngs, dtype=dtype)
+        self.dw = nnx.Conv(
+            d_model,
+            d_model,
+            (kernel_size,),
+            feature_group_count=d_model,
+            padding="SAME",
+            rngs=rngs,
+            dtype=dtype,
+        )
         self.post_norm = nnx.LayerNorm(d_model, rngs=rngs)
         self.pw2 = nnx.Conv(d_model, d_model, (1,), rngs=rngs, dtype=dtype)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
@@ -126,7 +160,18 @@ class FastConformerConvModule(nnx.Module):
 
 
 class FastConformerBlock(nnx.Module):
-    def __init__(self, d_model, num_heads, expansion, conv_kernel, dropout, drop_prob, rngs, dtype=jnp.float32, drop_anneal_steps=5000):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        expansion,
+        conv_kernel,
+        dropout,
+        drop_prob,
+        rngs,
+        dtype=jnp.float32,
+        drop_anneal_steps=5000,
+    ):
         self.ff1 = FastConformerFFN(d_model, expansion, dropout, rngs, dtype)
         self.attn = FastConformerMHSA(d_model, num_heads, dropout, rngs, dtype)
         self.conv = FastConformerConvModule(d_model, conv_kernel, dropout, rngs, dtype)
@@ -146,10 +191,17 @@ class FastConformerBlock(nnx.Module):
         if training and self.drop_prob > 0.0:
             drop_prob = self.drop_prob
             if step is not None:
-                drop_prob = self.drop_prob * jnp.minimum(step / float(self.drop_anneal_steps), 1.0)
+                drop_prob = self.drop_prob * jnp.minimum(
+                    step / float(self.drop_anneal_steps), 1.0
+                )
             keep = jax.random.bernoulli(self.rngs.dropout(), 1.0 - drop_prob)
             return jnp.where(keep, x, x_in)
         return x
+
+
+@nnx.remat(static_argnums=(3,))
+def remat_block_forward(block, x, mask, training, step):
+    return block(x, mask=mask, training=training, step=step)
 
 
 class FastConformerEncoder(nnx.Module):
@@ -172,16 +224,37 @@ class FastConformerEncoder(nnx.Module):
         if rngs is None:
             rngs = nnx.Rngs(0)
 
-        self.mel_spectogram = AudioToMelSpectrogram(n_mels=d_input, rng=rngs, normalize=True, spec_augment=True, pitch_shift=True, **featurizer_kwargs)
+        self.mel_spectogram = AudioToMelSpectrogram(
+            n_mels=d_input,
+            rng=rngs,
+            normalize=True,
+            spec_augment=True,
+            pitch_shift=True,
+            **featurizer_kwargs,
+        )
 
         self.conv_subsampler = Conv2dSubSampler(d_model, rngs, dtype)
         freq_dim = ((d_input - 3) // 2 + 1 - 3) // 2 + 1
-        self.linear_proj = nnx.Linear(d_model * freq_dim, d_model, rngs=rngs, dtype=dtype)
+        self.linear_proj = nnx.Linear(
+            d_model * freq_dim, d_model, rngs=rngs, dtype=dtype
+        )
 
-        self.layers = nnx.List([
-            FastConformerBlock(d_model, num_head, feed_forward_expansion_factor, conv_kernel_size, dropout, layer_drop_prob, rngs, dtype, drop_anneal_steps=layer_drop_anneal_steps)
-            for _ in range(num_layers)
-        ])
+        self.layers = nnx.List(
+            [
+                FastConformerBlock(
+                    d_model,
+                    num_head,
+                    feed_forward_expansion_factor,
+                    conv_kernel_size,
+                    dropout,
+                    layer_drop_prob,
+                    rngs,
+                    dtype,
+                    drop_anneal_steps=layer_drop_anneal_steps,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.decoder = nnx.Linear(d_model, token_count, rngs=rngs, dtype=dtype)
         self.d_model = d_model
 
@@ -202,7 +275,7 @@ class FastConformerEncoder(nnx.Module):
             mask = self.compute_mask(seq_len, x.shape[1])
 
         for layer in self.layers:
-            x = layer(x, mask, training=training, step=step)
+            x = remat_block_forward(layer, x, mask, training, step)
 
         return self.decoder(x), seq_len
 
@@ -213,29 +286,46 @@ class FastConformerEncoder(nnx.Module):
         x = self.linear_proj(x)
         x = x * jnp.sqrt(self.d_model)
         for layer in self.layers:
-            x = layer(x, mask=None, training=training)
+            x = remat_block_forward(layer, x, None, training, None)
         return self.decoder(x), seq_len
 
     def initialize_weights(self, rng_key: jax.Array):
+        num_layers = len(self.layers)
+        residual_scale = 1.0 / jnp.sqrt(2.0 * num_layers)
+
+        # Collect modules that are inside conformer blocks (residual branches)
+        residual_modules = set()
+        for layer in self.layers:
+            for _, mod in layer.iter_modules():
+                residual_modules.add(id(mod))
+
         def init_fn(module):
             nonlocal rng_key
             if isinstance(module, nnx.Linear):
                 rng_key, k1, k2 = jax.random.split(rng_key, 3)
                 limit = jnp.sqrt(3.0 / module.in_features)
-                if module.kernel.value.dtype == jnp.float16:
-                    limit = limit * 0.5
-                module.kernel.value = jax.random.uniform(k1, module.kernel.shape, minval=-limit, maxval=limit)
+                if id(module) in residual_modules:
+                    limit = limit * residual_scale
+                module.kernel.value = jax.random.uniform(
+                    k1, module.kernel.shape, minval=-limit, maxval=limit
+                )
                 if hasattr(module, "bias") and isinstance(module.bias, nnx.Param):
-                    module.bias.value = jax.random.uniform(k2, module.bias.shape, minval=-limit, maxval=limit)
+                    module.bias.value = jax.random.uniform(
+                        k2, module.bias.shape, minval=-limit, maxval=limit
+                    )
             elif isinstance(module, nnx.Conv):
                 rng_key, k1, k2 = jax.random.split(rng_key, 3)
                 fan_in = np.prod(module.kernel_size) * module.in_features
                 limit = jnp.sqrt(3.0 / fan_in)
-                if module.kernel.value.dtype == jnp.float16:
-                    limit = limit * 0.5
-                module.kernel.value = jax.random.uniform(k1, module.kernel.shape, minval=-limit, maxval=limit)
+                if id(module) in residual_modules:
+                    limit = limit * residual_scale
+                module.kernel.value = jax.random.uniform(
+                    k1, module.kernel.shape, minval=-limit, maxval=limit
+                )
                 if hasattr(module, "bias") and isinstance(module.bias, nnx.Param):
-                    module.bias.value = jax.random.uniform(k2, module.bias.shape, minval=-limit, maxval=limit)
+                    module.bias.value = jax.random.uniform(
+                        k2, module.bias.shape, minval=-limit, maxval=limit
+                    )
 
         for _, module in self.iter_modules():
             init_fn(module)

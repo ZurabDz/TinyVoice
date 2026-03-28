@@ -1,5 +1,6 @@
 import sys
-sys.path.append('..')
+
+sys.path.append("..")
 
 from conformer.tokenizer import Tokenizer
 import argparse
@@ -7,11 +8,11 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--processed_tsv_path', type=Path, required=True)
-parser.add_argument('--tokenizer_save_path', type=Path, required=True)
+parser.add_argument("--processed_tsv_path", type=Path, required=True)
+parser.add_argument("--tokenizer_save_path", type=Path, required=True)
 # args = parser.parse_args()
 
-args_params = '--processed_tsv_path /home/penguin/data/ka/train_processed.tsv --tokenizer_save_path /home/penguin/data/ka/packed_dataset/ '.split()
+args_params = "--processed_tsv_path /home/penguin/data/ka/train_processed.tsv --tokenizer_save_path /home/penguin/data/ka/packed_dataset/ ".split()
 args = parser.parse_args(args_params)
 
 tokenizer = Tokenizer(args.processed_tsv_path)

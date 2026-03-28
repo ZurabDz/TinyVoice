@@ -17,17 +17,20 @@ os.environ["XLA_FLAGS"] = (
     "--xla_gpu_enable_fast_min_max=true "
 )
 
-from conformer.tokenizer import Tokenizer, HuggingFaceBPETokenizer
-from conformer.decode import greedy_ctc_decode
 from conformer.config import TrainingArguments
-from conformer.model import FastConformerEncoder
-from flax import nnx
-import optax
+from conformer.decode import greedy_ctc_decode
+from conformer.factory import build_model
+from conformer.metrics import edit_distance, to_jax
+from conformer.prefetch import PrefetchIterator
+from conformer.steps import train_step, eval_step
+from conformer.tokenizer import Tokenizer
 from conformer.dataset import (
     build_data_sources,
     build_train_loader,
     build_test_loader,
 )
+from flax import nnx
+import optax
 import jax
 import numpy as np
 import jax.numpy as jnp
@@ -52,43 +55,19 @@ if DEV_MODE:
     # Use the largest bucket only — every real sample fits, so the shape never
     # changes after step 1. Lazy JIT fires exactly once on the first batch.
     args.bucket_sizes = [args.bucket_sizes[-1]]
-    print(f"DEV MODE: single bucket {args.bucket_sizes}, stopping after {DEV_STEPS} steps")
+    print(
+        f"DEV MODE: single bucket {args.bucket_sizes}, stopping after {DEV_STEPS} steps"
+    )
 else:
     print(f"Using dtype: {args.dtype}")
     print(f"Bucket sizes (audio_frames, label_len): {args.bucket_sizes}")
 
 tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
 tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
-token_count = (
-    tokenizer.vocab_size
-    if hasattr(tokenizer, "vocab_size")
-    else len(tokenizer.id_to_char)
-)
 
-model = FastConformerEncoder(
-    token_count=token_count,
-    num_layers=args.num_encoder_layers,
-    d_model=args.d_model,
-    num_head=args.num_attention_heads,
-    dropout=args.feed_forward_dropout_p,
-    feed_forward_expansion_factor=args.feed_forward_expansion_factor,
-    conv_kernel_size=args.conv_kernel_size,
-    layer_drop_prob=args.layer_drop_prob,
-    layer_drop_anneal_steps=args.layer_drop_anneal_steps,
-    d_input=args.n_mels,
-    sample_rate=args.sampling_rate,
-    n_fft=args.n_fft,
-    n_window_size=args.win_length,
-    n_window_stride=args.hop_length,
-    dtype=args.dtype,
-    rngs=nnx.Rngs(0),
-)
-model.initialize_weights(jax.random.PRNGKey(0))
+model = build_model(args, tokenizer)
 
 accum_steps = args.grad_accumulation_steps
-
-SCALE_GROWTH_INTERVAL = 2000
-
 
 import tensorflow as tf
 import orbax.checkpoint as ocp
@@ -134,7 +113,7 @@ def weight_decay_mask(params):
 
 
 # For fp16 training, use tighter gradient clipping
-grad_clip_value = 0.5 if args.dtype == jnp.float16 else 1.0
+grad_clip_value = 1.0
 inner_optimizer = optax.chain(
     # Clip by value first to prevent extreme gradients in fp16
     optax.clip(grad_clip_value),
@@ -161,176 +140,6 @@ loss_scale = jnp.array(2**15, dtype=jnp.float32)
 scale_fin_steps = jnp.array(0, dtype=jnp.int32)
 
 processed_test_dataset = build_test_loader(map_test_audio_dataset, tokenizer, args)
-
-
-def edit_distance(a, b):
-    """Levenshtein distance between two integer sequences."""
-    m, n = len(a), len(b)
-    if m == 0:
-        return n
-    if n == 0:
-        return m
-    dp = list(range(n + 1))
-    for i in range(1, m + 1):
-        prev, dp[0] = dp[0], i
-        for j in range(1, n + 1):
-            temp = dp[j]
-            dp[j] = prev if a[i - 1] == b[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
-            prev = temp
-    return dp[n]
-
-
-@jax.jit(static_argnums=(0, 2), donate_argnums=(1, 3))
-def train_step(
-    model_graphdef,
-    model_state,
-    optimizer_graphdef,
-    optimizer_state,
-    loss_scale,
-    scale_fin_steps,
-    padded_audios,
-    padded_labels,
-    frames,
-    label_lengths,
-    step,
-):
-    """Training step using Functional API"""
-    model = nnx.merge(model_graphdef, model_state)
-    optimizer = nnx.merge(optimizer_graphdef, optimizer_state)
-
-    def loss_fn(model):
-        logits, real_times = model(padded_audios, training=True, inputs_lengths=frames, step=step)
-
-        logit_paddings = (jnp.arange(logits.shape[1]) >= real_times[:, None]).astype(
-            jnp.float32
-        )
-        label_paddings = (
-            jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
-        ).astype(jnp.float32)
-
-        logits_f32 = logits.astype(jnp.float32)
-        per_sample_loss = optax.ctc_loss(
-            logits_f32,
-            logit_paddings,
-            padded_labels,
-            label_paddings,
-            blank_id=tokenizer.blank_id,
-        )
-        is_finite = jnp.isfinite(per_sample_loss)
-        finite_loss_ratio = is_finite.mean()
-
-        # Zero out infinite CTC losses (e.g. from impossible alignments)
-        per_sample_loss = jnp.where(is_finite, per_sample_loss, 0.0)
-        ctc_loss = per_sample_loss.mean()
-
-        # Entropy regularization: prevent over-confident peaky CTC distributions
-        # Wrapped in remat to avoid storing softmax activations during backprop
-        frame_mask = (1.0 - logit_paddings)  # 1 for valid, 0 for padding
-
-        @jax.remat
-        def compute_entropy(logits, mask):
-            log_probs = jax.nn.log_softmax(logits, axis=-1)
-            probs = jnp.exp(log_probs)
-            ent = -jnp.sum(probs * log_probs, axis=-1)  # (B, T)
-            return (ent * mask).sum() / jnp.maximum(mask.sum(), 1.0)
-
-        masked_entropy = compute_entropy(logits_f32, frame_mask)
-
-        loss = ctc_loss - args.entropy_weight * masked_entropy
-        return loss, finite_loss_ratio
-
-    def scaled_loss_fn(model):
-        loss, aux = loss_fn(model)
-        return loss * loss_scale, aux
-
-    (scaled_loss, finite_loss_ratio), grads = nnx.value_and_grad(
-        scaled_loss_fn, has_aux=True
-    )(model)
-    loss = scaled_loss / loss_scale
-
-    grads = jax.tree.map(lambda g: g / loss_scale, grads)
-    grad_finite = jnp.all(
-        jnp.array([jnp.all(jnp.isfinite(g)) for g in jax.tree.leaves(grads)])
-    )
-    grads = jax.tree.map(
-        lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)), grads
-    )
-
-    optimizer.update(model=model, grads=grads)
-
-    _, new_model_state = nnx.split(model)
-    _, new_optimizer_state = nnx.split(optimizer)
-
-    # Restore old state if gradients were non-finite — prevents Adam moments
-    # and weight decay from being applied on a zero-gradient step.
-    final_model_state = jax.tree.map(
-        lambda new, old: jnp.where(grad_finite, new, old),
-        new_model_state,
-        model_state,
-    )
-    final_optimizer_state = jax.tree.map(
-        lambda new, old: jnp.where(grad_finite, new, old),
-        new_optimizer_state,
-        optimizer_state,
-    )
-
-    # Update loss scale inline (avoids separate JIT dispatch round-trip)
-    def _on_finite(args):
-        ls, sfs = args
-        new_sfs = sfs + jnp.int32(1)
-        new_ls, new_sfs = jax.lax.cond(
-            new_sfs >= SCALE_GROWTH_INTERVAL,
-            lambda: (jnp.minimum(ls * jnp.float32(2.0), jnp.float32(2**24)), jnp.int32(0)),
-            lambda: (ls, new_sfs),
-        )
-        return new_ls, new_sfs
-
-    def _on_infinite(args):
-        ls, _ = args
-        return jnp.maximum(ls * jnp.float32(0.5), jnp.float32(1.0)), jnp.int32(0)
-
-    new_loss_scale, new_scale_fin_steps = jax.lax.cond(
-        grad_finite, _on_finite, _on_infinite, (loss_scale, scale_fin_steps)
-    )
-
-    return loss, finite_loss_ratio, grad_finite, final_model_state, final_optimizer_state, new_loss_scale, new_scale_fin_steps
-
-
-@jax.jit(static_argnums=(0,))
-def eval_step(
-    model_graphdef: nnx.GraphDef,
-    model_state: nnx.State,
-    padded_audios: jnp.ndarray,
-    padded_labels: jnp.ndarray,
-    frames: jnp.ndarray,
-    label_lengths: jnp.ndarray,
-):
-    """Evaluation step"""
-    model = nnx.merge(model_graphdef, model_state)
-
-    logits, real_times = model(padded_audios, training=False, inputs_lengths=frames)
-
-    logit_paddings = (jnp.arange(logits.shape[1]) >= real_times[:, None]).astype(
-        jnp.float32
-    )
-    label_paddings = (
-        jnp.arange(padded_labels.shape[1]) >= label_lengths[:, None]
-    ).astype(jnp.float32)
-
-    logits_f32 = logits.astype(jnp.float32)
-    per_sample_loss = optax.ctc_loss(
-        logits_f32,
-        logit_paddings,
-        padded_labels,
-        label_paddings,
-        blank_id=tokenizer.blank_id,
-    )
-    is_finite = jnp.isfinite(per_sample_loss)
-    finite_ratio = is_finite.mean()
-    finite_loss = jnp.where(is_finite, per_sample_loss, 0.0).sum() / jnp.maximum(is_finite.sum(), 1)
-
-    return finite_loss, finite_ratio, logits, real_times
-
 
 # Initial Split
 model_graphdef, model_state = nnx.split(model)
@@ -363,6 +172,8 @@ if not DEV_MODE:
             d_frames,
             d_label_lengths,
             jnp.int32(0),  # step
+            jnp.int32(tokenizer.blank_id),
+            jnp.float32(args.entropy_weight),
         ).compile()
         print(f"Compiled bucket: audio_frames={b_frames}, label_len={b_label}")
 
@@ -372,75 +183,8 @@ processed_train_dataset = build_train_loader(
 )
 global_step = 0
 
-
-def _to_jax(elem):
-    """Transfer a batch tuple to JAX device arrays."""
-    return (
-        jnp.array(elem[0], dtype=jnp.float32),  # audios
-        jnp.array(elem[1], dtype=jnp.int32),     # frames
-        jnp.array(elem[2], dtype=jnp.int32),     # labels
-        jnp.array(elem[3], dtype=jnp.int32),     # label_lengths
-    )
-
-
-import queue
-import threading
-
-class PrefetchIterator:
-    """Runs data loading and H2D transfer in a background thread."""
-    def __init__(self, iterator, transform_fn, buffer_size=4):
-        self.iterator = iterator
-        self.transform_fn = transform_fn
-        self.queue = queue.Queue(maxsize=buffer_size)
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._worker)
-        self.thread.daemon = True
-        self.thread.start()
-
-    def _worker(self):
-        try:
-            for item in self.iterator:
-                if self.stop_event.is_set():
-                    break
-                # Apply transformation (e.g., _to_jax) and queue it
-                # The JAX array creation here happens in the thread, triggering async H2D.
-                try:
-                    transformed = self.transform_fn(item)
-                    self.queue.put(transformed)
-                except Exception as e:
-                    print(f"Prefetch worker error: {e}")
-                    self.queue.put(None)
-                    break
-        except StopIteration:
-            self.queue.put(None)
-        except Exception as e:
-             print(f"Prefetch worker iterator error: {e}")
-             self.queue.put(None)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        item = self.queue.get()
-        if item is None:
-            raise StopIteration
-        return item
-
-    def close(self):
-        self.stop_event.set()
-        # Drain queue to allow worker to exit if stuck in put()
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
-        self.thread.join(timeout=1.0)
-
-
 # Wrap the original iterator with prefetching
-# Note: we recreate the iterator to ensure clean state if needed,
-# though here we just wrap the existing one.
-prefetch_iter = PrefetchIterator(iter(processed_train_dataset), _to_jax, buffer_size=8)
+prefetch_iter = PrefetchIterator(iter(processed_train_dataset), to_jax, buffer_size=8)
 
 # Prime: fetch the first batch (this will block until the worker produces one)
 try:
@@ -459,7 +203,15 @@ for epoch in range(args.num_epochs):
             jax.profiler.start_trace("./runs/profile")
 
         # 1. Dispatch — non-blocking, GPU starts immediately.
-        loss, finite_ratio, grad_finite, model_state, optimizer_state, loss_scale, scale_fin_steps = train_step(
+        (
+            loss,
+            finite_ratio,
+            grad_finite,
+            model_state,
+            optimizer_state,
+            loss_scale,
+            scale_fin_steps,
+        ) = train_step(
             model_graphdef,
             model_state,
             optimizer_graphdef,
@@ -471,6 +223,8 @@ for epoch in range(args.num_epochs):
             cur_frames,
             cur_label_lengths,
             jnp.int32(global_step),
+            jnp.int32(tokenizer.blank_id),
+            jnp.float32(args.entropy_weight),
         )
 
         # Stop profiler trace after configured number of steps
@@ -518,8 +272,9 @@ for epoch in range(args.num_epochs):
                     "train/finite_ratio", float(finite_ratio), step=global_step
                 )
                 tf.summary.scalar("train/learning_rate", current_lr, step=global_step)
-                tf.summary.scalar("train/loss_scale", float(loss_scale), step=global_step)
-
+                tf.summary.scalar(
+                    "train/loss_scale", float(loss_scale), step=global_step
+                )
 
     # Validation after each epoch
     print(f"\nRunning validation after epoch {epoch + 1}...")
@@ -530,12 +285,7 @@ for epoch in range(args.num_epochs):
     val_cer_len = 0
 
     for element in tqdm(processed_test_dataset, desc="Validation"):
-        padded_audios, frames, padded_labels, label_lengths = element
-        # Convert numpy arrays to JAX arrays
-        padded_audios = jnp.array(padded_audios, dtype=jnp.float32)
-        padded_labels = jnp.array(padded_labels, dtype=jnp.int32)
-        frames = jnp.array(frames, dtype=jnp.int32)
-        label_lengths = jnp.array(label_lengths, dtype=jnp.int32)
+        padded_audios, frames, padded_labels, label_lengths = to_jax(element)
 
         val_loss, val_finite_ratio, logits, out_lengths = eval_step(
             model_graphdef,
@@ -544,6 +294,7 @@ for epoch in range(args.num_epochs):
             padded_labels,
             frames,
             label_lengths,
+            jnp.int32(tokenizer.blank_id),
         )
         val_loss_sum += float(val_loss)
         val_finite_ratio_sum += float(val_finite_ratio)
@@ -575,7 +326,9 @@ for epoch in range(args.num_epochs):
         tf.summary.scalar("epoch/train_loss", avg_epoch_train_loss, step=global_step)
         tf.summary.scalar("epoch/val_loss", avg_val_loss, step=global_step)
         tf.summary.scalar("epoch/val_cer", val_cer, step=global_step)
-        tf.summary.scalar("epoch/val_finite_ratio", avg_val_finite_ratio, step=global_step)
+        tf.summary.scalar(
+            "epoch/val_finite_ratio", avg_val_finite_ratio, step=global_step
+        )
 
     if DEV_MODE and global_step >= DEV_STEPS:
         break
