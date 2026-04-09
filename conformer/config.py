@@ -1,37 +1,23 @@
 from dataclasses import dataclass, field
+
 import jax.numpy as jnp
 
 
-def _round_up_to_multiple(x, m):
-    return ((x + m - 1) // m) * m
-
-
-def _default_buckets():
-    # bucket sizes: (audio_frames, label_length)
-    # TODO: freatures >= labels for ctc loss this hardcoding needs fix
-    # Ensure audio_frames >= label_length * 704 (approx subsampling factor 640 + 10% margin)
-    # Subsampling: hop_length=160 * conv_stride=4 = 640
-    # All dimensions padded to multiples of 8 for XLA vectorization
-    raw_buckets = [
-        (67040, 94),
+def _default_buckets() -> list[tuple[int, int]]:
+    # (audio_frames, label_length) buckets sorted ascending by audio_frames.
+    # Constraint: audio_frames >= label_length * 704 (hop_length 160 * conv stride
+    # 4 = 640, +10% margin), so CTC always has at least one frame per label.
+    return [
+        (67584, 96),
         (87520, 120),
-        (128480, 154),
+        (128480, 160),
         (176000, 200),
     ]
-    adjusted = []
-    for audio_frames, label_len in raw_buckets:
-        label_len = _round_up_to_multiple(label_len, 8)
-        min_audio = int(label_len * 704)
-        audio_frames = _round_up_to_multiple(max(audio_frames, min_audio), 8)
-        adjusted.append((audio_frames, label_len))
-
-    return adjusted
 
 
 @dataclass
 class TrainingArguments:
-    # Optimizer configs
-    learning_rate: float = 5e-4
+    # Optimizer
     grad_accumulation_steps: int = 1
     grad_clip: float = 5.0
     weight_decay: float = 0.01
@@ -41,47 +27,47 @@ class TrainingArguments:
     lr_decay_steps: int = 190000
     lr_end_value: float = 1e-6
 
-    # Model configs
+    # Model
     d_model: int = 256
     num_encoder_layers: int = 16
     num_attention_heads: int = 4
     feed_forward_expansion_factor: int = 4
     feed_forward_dropout_p: float = 0.1
-    attention_dropout_p: float = 0.1
-    conv_dropout_p: float = 0.1
     conv_kernel_size: int = 9
-    subsampling_factor: int = 4
     layer_drop_prob: float = 0.1
     layer_drop_anneal_steps: int = 20000
     entropy_weight: float = 0.02
 
-    # Feature extraction configs
+    # Feature extraction
     sampling_rate: int = 16000
     n_fft: int = 512
     win_length: int = 400
     hop_length: int = 160
     n_mels: int = 128
 
-    # Trainer configs
-    dtype: jnp.dtype = jnp.float16
+    # Trainer
+    dtype: jnp.dtype = jnp.bfloat16
     num_epochs: int = 50
     batch_size: int = 24
-    log_steps: int = 5
-    val_every: int = 500
+    log_steps: int = 20
     checkpoint_dir: str = "./checkpoints"
     save_steps: int = 500
     save_total_limit: int = 5
+    loss_sync_steps: int = 50
+    device_prefetch_batches: int = 4
 
-    # Dataset & Dataloader
+    # Data loader
     data_dir: str = "/home/penguin/data/ka"
     worker_count: int = 16
     prefetch_buffer_size: int = 64
+    enable_speed_perturb: bool = True
+    enable_additive_noise: bool = True
+    enable_reverb: bool = True
     bucket_sizes: list[tuple[int, int]] = field(default_factory=_default_buckets)
 
     def __post_init__(self):
-        if self.bucket_sizes and self.bucket_sizes != sorted(
-            self.bucket_sizes, key=lambda x: x[0]
-        ):
-            self.bucket_sizes = sorted(self.bucket_sizes, key=lambda x: x[0])
+        self.bucket_sizes = sorted(self.bucket_sizes, key=lambda b: b[0])
         if self.lr_warmup_steps >= self.lr_decay_steps:
             self.lr_warmup_steps = self.lr_decay_steps // 10
+        self.loss_sync_steps = max(int(self.loss_sync_steps), 1)
+        self.device_prefetch_batches = max(int(self.device_prefetch_batches), 1)

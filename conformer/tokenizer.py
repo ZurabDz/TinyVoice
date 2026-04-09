@@ -1,84 +1,65 @@
-from pathlib import Path
-import pandas as pd
-import numpy as np
+import csv
 import pickle
-from typing import Union
+from pathlib import Path
+
+import numpy as np
 
 
 class Tokenizer:
+    """Character tokenizer with explicit <BLANK> (id 0) and <PAD> (last id)."""
+
+    BLANK_TOKEN = "<BLANK>"
+    PAD_TOKEN = "<PAD>"
+
     def __init__(self, file_path: Path):
-        self.file_path = file_path
-        self.char_to_id = {}
-        self.id_to_char = {}
-        self.blank_id = None
-        self.label_pad_token = None
-        self._construct_tokenizer()
+        self.file_path = Path(file_path)
+        chars = self._collect_characters(self.file_path)
 
-    def encode(self, text: str):
-        ids = []
-        for ch in text:
-            if ch in self.char_to_id:
-                ids.append(self.char_to_id[ch])
-        return np.array(ids)
+        self.char_to_id = {self.BLANK_TOKEN: 0}
+        self.id_to_char = {0: self.BLANK_TOKEN}
+        for i, ch in enumerate(sorted(chars), start=1):
+            self.char_to_id[ch] = i
+            self.id_to_char[i] = ch
 
-    def decode(self, ids):
-        return [self.id_to_char[_id] for _id in ids]
+        pad_id = len(self.char_to_id)
+        self.char_to_id[self.PAD_TOKEN] = pad_id
+        self.id_to_char[pad_id] = self.PAD_TOKEN
 
-    def _construct_tokenizer(self):
-        df = pd.read_csv(self.file_path, sep="\t")
-        all_chars = sorted(set("".join(df["label"].dropna())))
-
-        self.id_to_char[0] = "<BLANK>"
         self.blank_id = 0
-
-        self.char_to_id["<BLANK>"] = 0
-
-        for i, char in enumerate(all_chars, 1):
-            self.char_to_id[char] = i
-            self.id_to_char[i] = char
-
-        self.char_to_id["<PAD>"] = len(self.char_to_id)
-        self.id_to_char[self.char_to_id["<PAD>"]] = "<PAD>"
-        self.label_pad_token = self.char_to_id["<PAD>"]
+        self.pad_id = pad_id
+        self.label_pad_token = pad_id
         self.vocab_size = len(self.char_to_id)
 
-    def save_tokenizer(self, save_path: Path):
-        with open(save_path / "tokenizer.pkl", "wb") as f:
-            pickle.dump(self, f)
-
     @staticmethod
-    def load_tokenizer(path: Path):
-        with open(path, "rb") as f:
-            return pickle.load(f)
-
-
-class HuggingFaceBPETokenizer:
-    def __init__(self, tokenizer_path: Path):
-        from tokenizers import Tokenizer as HFTokenizer
-
-        self.tokenizer = HFTokenizer.from_file(str(tokenizer_path))
-        self.blank_id = self.tokenizer.token_to_id("<BLANK>")
-        self.padding_id = self.tokenizer.token_to_id("<PAD>")
-        self.vocab_size = self.tokenizer.get_vocab_size()
+    def _collect_characters(file_path: Path) -> set[str]:
+        chars = set()
+        with file_path.open(newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            for row in reader:
+                chars.update(row.get("label") or "")
+        return chars
 
     def encode(self, text: str) -> np.ndarray:
-        encoding = self.tokenizer.encode(text)
-        return np.array(encoding.ids)
+        return np.fromiter(
+            (self.char_to_id[ch] for ch in text if ch in self.char_to_id),
+            dtype=np.int32,
+        )
 
-    def decode(self, ids: Union[np.ndarray, list]) -> str:
-        return self.tokenizer.decode(ids)
+    def decode(self, ids, skip_special_tokens: bool = True) -> str:
+        special_ids = {self.blank_id, self.pad_id}
+        return "".join(
+            self.id_to_char.get(int(i), "")
+            for i in ids
+            if not skip_special_tokens or int(i) not in special_ids
+        )
 
-    def batch_encode(self, texts: list[str]) -> list[np.ndarray]:
-        encodings = self.tokenizer.encode_batch(texts)
-        return [np.array(e.ids) for e in encodings]
+    def save_tokenizer(self, save_path: Path) -> None:
+        save_path = Path(save_path)
+        with (save_path / "tokenizer.pkl").open("wb") as fh:
+            pickle.dump(self, fh)
 
     @staticmethod
-    def load(path: Path) -> "HuggingFaceBPETokenizer":
-        return HuggingFaceBPETokenizer(path)
-
-    @staticmethod
-    def from_pretrained(save_path: Path) -> "HuggingFaceBPETokenizer":
-        tokenizer_file = save_path / "tokenizer.json"
-        if tokenizer_file.exists():
-            return HuggingFaceBPETokenizer(tokenizer_file)
-        raise FileNotFoundError(f"Tokenizer file not found at {tokenizer_file}")
+    def load_tokenizer(path: Path) -> "Tokenizer":
+        path = Path(path)
+        with path.open("rb") as fh:
+            return pickle.load(fh)

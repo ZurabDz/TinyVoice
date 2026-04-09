@@ -1,7 +1,6 @@
 import pandas as pd
 from pathlib import Path
 import librosa
-from pandas.core.frame import DataFrame
 import soundfile as sf
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed

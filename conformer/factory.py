@@ -1,6 +1,5 @@
 import os
 
-import jax
 import orbax.checkpoint as ocp
 from flax import nnx
 
@@ -9,17 +8,12 @@ from conformer.model import FastConformerEncoder
 
 
 def build_model(args: TrainingArguments, tokenizer) -> FastConformerEncoder:
-    """Construct and weight-initialize a FastConformerEncoder from config."""
-    token_count = (
-        tokenizer.vocab_size
-        if hasattr(tokenizer, "vocab_size")
-        else len(tokenizer.id_to_char)
-    )
-    model = FastConformerEncoder(
-        token_count=token_count,
+    """Construct a FastConformerEncoder from config + tokenizer vocab size."""
+    return FastConformerEncoder(
+        token_count=tokenizer.vocab_size,
         num_layers=args.num_encoder_layers,
         d_model=args.d_model,
-        num_head=args.num_attention_heads,
+        num_heads=args.num_attention_heads,
         dropout=args.feed_forward_dropout_p,
         feed_forward_expansion_factor=args.feed_forward_expansion_factor,
         conv_kernel_size=args.conv_kernel_size,
@@ -33,21 +27,19 @@ def build_model(args: TrainingArguments, tokenizer) -> FastConformerEncoder:
         dtype=args.dtype,
         rngs=nnx.Rngs(0),
     )
-    model.initialize_weights(jax.random.PRNGKey(0))
-    return model
 
 
 def load_checkpoint(model, checkpoint_dir: str):
-    """Restore latest checkpoint into model. Returns (model, step) or (model, None)."""
+    """Restore the latest checkpoint into `model`. Returns (model, step or None)."""
     mngr = ocp.CheckpointManager(os.path.abspath(checkpoint_dir))
-    latest_step = mngr.latest_step()
-    if latest_step is None:
+    latest = mngr.latest_step()
+    if latest is None:
         mngr.close()
         return model, None
     restored = mngr.restore(
-        latest_step,
+        latest,
         args=ocp.args.Composite(model=ocp.args.StandardRestore(nnx.state(model))),
     )
     nnx.update(model, restored.model)
     mngr.close()
-    return model, latest_step
+    return model, latest

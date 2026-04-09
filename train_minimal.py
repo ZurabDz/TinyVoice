@@ -1,346 +1,479 @@
+"""Minimal end-to-end CTC training for the FastConformer ASR encoder."""
+
+import csv
 import os
+import queue
+import threading
+from pathlib import Path
+from statistics import mean
 
-import tensorflow as tf
-
-tf.config.set_visible_devices([], "GPU")
-
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.98"
-os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_enable_command_buffer= "
-    "--xla_gpu_strict_conv_algorithm_picker=false "
-    "--xla_gpu_triton_gemm_any=true "
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_enable_highest_priority_async_stream=true "
-    "--xla_gpu_ftz=true "
-    "--xla_gpu_enable_fast_min_max=true "
-)
+import jax
+import jax.numpy as jnp
+import jiwer
+import numpy as np
+import optax
+import orbax.checkpoint as ocp
+from flax import nnx
+from tqdm.auto import tqdm
 
 from conformer.config import TrainingArguments
-from conformer.decode import greedy_ctc_decode
+from conformer.dataset import build_data_sources, build_test_loader, build_train_loader
+from conformer.decode import decode_token_ids, greedy_ctc_decode_text
 from conformer.factory import build_model
-from conformer.metrics import edit_distance, to_jax
-from conformer.prefetch import PrefetchIterator
-from conformer.steps import train_step, eval_step
 from conformer.tokenizer import Tokenizer
-from conformer.dataset import (
-    build_data_sources,
-    build_train_loader,
-    build_test_loader,
-)
-from flax import nnx
-import optax
-import jax
-import numpy as np
-import jax.numpy as jnp
-import jax.profiler
-from pathlib import Path
-
-
-# Enable JAX compilation caching
-cache_dir = Path.home() / ".cache" / "jax_compilation_cache"
-cache_dir.mkdir(parents=True, exist_ok=True)
-jax.config.update("jax_compilation_cache_dir", str(cache_dir))
-
-from tqdm.auto import tqdm
 
 DEV_MODE = os.environ.get("TINYVOICE_DEV", "0") == "1"
 DEV_STEPS = int(os.environ.get("TINYVOICE_DEV_STEPS", "10000"))
-PROFILE_START_STEP = int(os.environ.get("TINYVOICE_PROFILE_START", "0"))
-PROFILE_STEPS = int(os.environ.get("TINYVOICE_PROFILE_STEPS", "0"))
-
-args = TrainingArguments()
-if DEV_MODE:
-    # Use the largest bucket only — every real sample fits, so the shape never
-    # changes after step 1. Lazy JIT fires exactly once on the first batch.
-    args.bucket_sizes = [args.bucket_sizes[-1]]
-    print(
-        f"DEV MODE: single bucket {args.bucket_sizes}, stopping after {DEV_STEPS} steps"
-    )
-else:
-    print(f"Using dtype: {args.dtype}")
-    print(f"Bucket sizes (audio_frames, label_len): {args.bucket_sizes}")
-
-tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
-tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
-
-model = build_model(args, tokenizer)
-
-accum_steps = args.grad_accumulation_steps
-
-import tensorflow as tf
-import orbax.checkpoint as ocp
-
-# TensorBoard Setup
-tb_writer = tf.summary.create_file_writer("./runs")
-
-# Checkpoint Setup (using refactored API)
-checkpoint_dir = os.path.abspath(args.checkpoint_dir)
-options = ocp.CheckpointManagerOptions(
-    max_to_keep=args.save_total_limit,
-    save_interval_steps=args.save_steps,
-    enable_async_checkpointing=True,
-)
-mngr = ocp.CheckpointManager(checkpoint_dir, options=options)
-
-map_train_audio_dataset, map_test_audio_dataset, steps_per_epoch = build_data_sources(
-    args.data_dir, args.sampling_rate, args.batch_size
-)
-total_steps = steps_per_epoch * args.num_epochs
-print(
-    f"Filtered train samples: {len(map_train_audio_dataset)}, steps/epoch: {steps_per_epoch}, total steps: {total_steps}"
-)
-
-# Auto-align lr_decay_steps to actual training length so the cosine decay reaches
-# lr_end_value exactly at the final step rather than flatlining early.
-args.lr_decay_steps = total_steps
-print(f"lr_decay_steps auto-set to {args.lr_decay_steps}")
-
-# LR schedule counts in optimizer steps (total_steps / accum_steps)
-lr_schedule = optax.warmup_cosine_decay_schedule(
-    init_value=args.lr_init_value,
-    peak_value=args.lr_peak_value,
-    warmup_steps=args.lr_warmup_steps // accum_steps,
-    decay_steps=args.lr_decay_steps // accum_steps,
-    end_value=args.lr_end_value,
-)
 
 
-# Weight decay mask: apply weight decay only to weights (ndim > 1), not biases (ndim == 1)
-def weight_decay_mask(params):
-    return jax.tree_util.tree_map(lambda x: x.ndim > 1, params)
+def configure_jax_cache():
+    """Cache JIT compilations across runs."""
+    cache_dir = Path.home() / ".cache" / "jax_compilation_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", str(cache_dir))
 
 
-# For fp16 training, use tighter gradient clipping
-grad_clip_value = 1.0
-inner_optimizer = optax.chain(
-    # Clip by value first to prevent extreme gradients in fp16
-    optax.clip(grad_clip_value),
-    optax.clip_by_global_norm(args.grad_clip),
-    optax.adamw(
-        learning_rate=lr_schedule,
-        b1=0.9,
-        b2=0.98,
-        eps=1e-7,
-        weight_decay=args.weight_decay,
-        mask=weight_decay_mask,
-    ),
-)
+def build_training_args() -> TrainingArguments:
+    args = TrainingArguments()
+    if DEV_MODE:
+        args.bucket_sizes = [args.bucket_sizes[-1]]
+        args.enable_speed_perturb = False
+        args.enable_additive_noise = False
+        args.enable_reverb = False
+        print(
+            "DEV MODE:"
+            f" single bucket {args.bucket_sizes}, stopping at {DEV_STEPS} steps,"
+            " waveform augments disabled"
+        )
+    else:
+        print(f"dtype={args.dtype}  buckets={args.bucket_sizes}")
+    return args
 
-if accum_steps > 1:
-    tx = optax.MultiSteps(inner_optimizer, every_k_schedule=accum_steps)
-else:
-    tx = inner_optimizer
 
-optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+def load_tokenizer(args: TrainingArguments) -> Tokenizer:
+    tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
+    return Tokenizer.load_tokenizer(tokenizer_path)
 
-# Adaptive loss scale state (replicates DynamicScale defaults)
-loss_scale = jnp.array(2**15, dtype=jnp.float32)
-scale_fin_steps = jnp.array(0, dtype=jnp.int32)
 
-processed_test_dataset = build_test_loader(map_test_audio_dataset, tokenizer, args)
+def build_optimizer(args: TrainingArguments, model, total_steps: int):
+    accum_steps = args.grad_accumulation_steps
+    args.lr_decay_steps = total_steps
+    schedule_steps = max(total_steps // accum_steps, 1)
+    warmup_steps = max(args.lr_warmup_steps // accum_steps, 1)
 
-# Initial Split
-model_graphdef, model_state = nnx.split(model)
-optimizer_graphdef, optimizer_state = nnx.split(optimizer)
-
-if not DEV_MODE:
-    print("Pre-compiling for all buckets...")
-
-    # Build abstract (shape-only) versions of the static pytrees once.
-    abstract_model_state = jax.eval_shape(lambda: model_state)
-    abstract_optimizer_state = jax.eval_shape(lambda: optimizer_state)
-
-    for b_frames, b_label in tqdm(args.bucket_sizes, desc="Compiling buckets"):
-        # Dummy inputs — only shape & dtype matter, values are never used.
-        d_audios = jnp.zeros((args.batch_size, b_frames), dtype=jnp.float32)
-        d_labels = jnp.zeros((args.batch_size, b_label), dtype=jnp.int32)
-        d_frames = jnp.full((args.batch_size,), b_frames, dtype=jnp.int32)
-        d_label_lengths = jnp.full((args.batch_size,), b_label, dtype=jnp.int32)
-
-        # Lower using abstract states — real buffers are never donated.
-        train_step.lower(
-            model_graphdef,
-            abstract_model_state,
-            optimizer_graphdef,
-            abstract_optimizer_state,
-            loss_scale,
-            scale_fin_steps,
-            d_audios,
-            d_labels,
-            d_frames,
-            d_label_lengths,
-            jnp.int32(0),  # step
-            jnp.int32(tokenizer.blank_id),
-            jnp.float32(args.entropy_weight),
-        ).compile()
-        print(f"Compiled bucket: audio_frames={b_frames}, label_len={b_label}")
-
-# Training Loop
-processed_train_dataset = build_train_loader(
-    map_train_audio_dataset, tokenizer, args, args.num_epochs
-)
-global_step = 0
-
-# Wrap the original iterator with prefetching
-prefetch_iter = PrefetchIterator(iter(processed_train_dataset), to_jax, buffer_size=8)
-
-# Prime: fetch the first batch (this will block until the worker produces one)
-try:
-    cur_audios, cur_frames, cur_labels, cur_label_lengths = next(prefetch_iter)
-except StopIteration:
-    raise RuntimeError("Dataset is empty!")
-
-for epoch in range(args.num_epochs):
-    train_loss_sum = jnp.float32(0.0)
-    train_steps = 0
-
-    pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch + 1}/{args.num_epochs}")
-    for _ in pbar:
-        # Start profiler trace at configured step
-        if PROFILE_STEPS > 0 and global_step == PROFILE_START_STEP:
-            jax.profiler.start_trace("./runs/profile")
-
-        # 1. Dispatch — non-blocking, GPU starts immediately.
-        (
-            loss,
-            finite_ratio,
-            grad_finite,
-            model_state,
-            optimizer_state,
-            loss_scale,
-            scale_fin_steps,
-        ) = train_step(
-            model_graphdef,
-            model_state,
-            optimizer_graphdef,
-            optimizer_state,
-            loss_scale,
-            scale_fin_steps,
-            cur_audios,
-            cur_labels,
-            cur_frames,
-            cur_label_lengths,
-            jnp.int32(global_step),
-            jnp.int32(tokenizer.blank_id),
-            jnp.float32(args.entropy_weight),
+    if schedule_steps <= 1:
+        lr_schedule = optax.constant_schedule(args.lr_peak_value)
+    elif warmup_steps >= schedule_steps:
+        lr_schedule = optax.linear_schedule(
+            init_value=args.lr_init_value,
+            end_value=args.lr_peak_value,
+            transition_steps=max(schedule_steps - 1, 1),
+        )
+    else:
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=args.lr_init_value,
+            peak_value=args.lr_peak_value,
+            warmup_steps=warmup_steps,
+            decay_steps=schedule_steps,
+            end_value=args.lr_end_value,
         )
 
-        # Stop profiler trace after configured number of steps
-        if PROFILE_STEPS > 0 and global_step == PROFILE_START_STEP + PROFILE_STEPS:
-            loss.block_until_ready()
-            jax.profiler.stop_trace()
-
-        # 2. While GPU runs, fetch the next batch from the prefetch queue.
-        #    The worker thread has likely already prepared this.
-        try:
-            cur_audios, cur_frames, cur_labels, cur_label_lengths = next(prefetch_iter)
-        except StopIteration:
-            # Should not happen with .repeat(), but safe to handle
-            break
-
-        train_loss_sum = train_loss_sum + loss  # accumulate on-device, no CPU sync
-        train_steps += 1
-        global_step += 1
-
-        if DEV_MODE and global_step >= DEV_STEPS:
-            break
-
-        if global_step > 1 and mngr.should_save(global_step):
-            mngr.save(
-                global_step,
-                args=ocp.args.Composite(
-                    model=ocp.args.StandardSave(model_state),
-                    optimizer=ocp.args.StandardSave(optimizer_state),
-                ),
-            )
-
-        if global_step % args.log_steps == 0 or global_step < 10:
-            avg_train_loss = float(train_loss_sum) / train_steps  # single CPU sync
-            pbar.set_postfix(
-                {
-                    "loss": f"{avg_train_loss:.4f}",
-                    "finite": f"{float(finite_ratio):.2f}",
-                    "step": global_step,
-                }
-            )
-            current_lr = float(lr_schedule(global_step // accum_steps))
-            with tb_writer.as_default():
-                tf.summary.scalar("train/loss", avg_train_loss, step=global_step)
-                tf.summary.scalar(
-                    "train/finite_ratio", float(finite_ratio), step=global_step
-                )
-                tf.summary.scalar("train/learning_rate", current_lr, step=global_step)
-                tf.summary.scalar(
-                    "train/loss_scale", float(loss_scale), step=global_step
-                )
-
-    # Validation after each epoch
-    print(f"\nRunning validation after epoch {epoch + 1}...")
-    val_loss_sum = 0.0
-    val_finite_ratio_sum = 0.0
-    val_steps = 0
-    val_cer_dist = 0
-    val_cer_len = 0
-
-    for element in tqdm(processed_test_dataset, desc="Validation"):
-        padded_audios, frames, padded_labels, label_lengths = to_jax(element)
-
-        val_loss, val_finite_ratio, logits, out_lengths = eval_step(
-            model_graphdef,
-            model_state,
-            padded_audios,
-            padded_labels,
-            frames,
-            label_lengths,
-            jnp.int32(tokenizer.blank_id),
-        )
-        val_loss_sum += float(val_loss)
-        val_finite_ratio_sum += float(val_finite_ratio)
-        val_steps += 1
-
-        # Greedy CTC decode for CER
-        pred_ids = np.argmax(np.array(logits), axis=-1)  # (B, T)
-        for i, (pred, length, ref, ref_len) in enumerate(
-            zip(
-                pred_ids,
-                np.array(out_lengths),
-                np.array(padded_labels),
-                np.array(label_lengths),
-            )
-        ):
-            decoded = greedy_ctc_decode(np.array(logits)[i], length, tokenizer.blank_id)
-            reference = ref[:ref_len].tolist()
-            val_cer_dist += edit_distance(decoded, reference)
-            val_cer_len += len(reference)
-
-    avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else 0.0
-    avg_val_finite_ratio = val_finite_ratio_sum / val_steps if val_steps > 0 else 0.0
-    val_cer = val_cer_dist / max(val_cer_len, 1)
-    avg_epoch_train_loss = train_loss_sum / train_steps
-    print(
-        f"Epoch {epoch + 1} - Train Loss: {avg_epoch_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val CER: {val_cer:.4f}, Val Finite: {avg_val_finite_ratio:.4f}\n"
-    )
-    with tb_writer.as_default():
-        tf.summary.scalar("epoch/train_loss", avg_epoch_train_loss, step=global_step)
-        tf.summary.scalar("epoch/val_loss", avg_val_loss, step=global_step)
-        tf.summary.scalar("epoch/val_cer", val_cer, step=global_step)
-        tf.summary.scalar(
-            "epoch/val_finite_ratio", avg_val_finite_ratio, step=global_step
-        )
-
-    if DEV_MODE and global_step >= DEV_STEPS:
-        break
-
-# Save final checkpoint if not already saved
-if not mngr.should_save(global_step):
-    mngr.save(
-        global_step,
-        args=ocp.args.Composite(
-            model=ocp.args.StandardSave(model_state),
-            optimizer=ocp.args.StandardSave(optimizer_state),
+    inner_optimizer = optax.chain(
+        optax.clip_by_global_norm(args.grad_clip),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=0.9,
+            b2=0.98,
+            eps=1e-7,
+            weight_decay=args.weight_decay,
+            mask=lambda params: jax.tree_util.tree_map(lambda value: value.ndim > 1, params),
         ),
     )
-    mngr.wait_until_finished()
+    tx = (
+        optax.MultiSteps(inner_optimizer, every_k_schedule=accum_steps)
+        if accum_steps > 1
+        else inner_optimizer
+    )
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    return optimizer, lr_schedule
+
+
+def create_checkpoint_manager(args: TrainingArguments):
+    return ocp.CheckpointManager(
+        os.path.abspath(args.checkpoint_dir),
+        options=ocp.CheckpointManagerOptions(
+            max_to_keep=args.save_total_limit,
+            save_interval_steps=args.save_steps,
+        ),
+    )
+
+
+def save_checkpoint(checkpoint_manager, model, optimizer, step: int):
+    checkpoint_manager.save(
+        step,
+        args=ocp.args.Composite(
+            model=ocp.args.StandardSave(nnx.state(model)),
+            optimizer=ocp.args.StandardSave(nnx.state(optimizer)),
+        ),
+    )
+
+
+def to_jax_batch(batch):
+    audios, labels, audio_lengths, label_lengths = batch
+    return (
+        jnp.asarray(audios, dtype=jnp.float32),
+        jnp.asarray(labels, dtype=jnp.int32),
+        jnp.asarray(audio_lengths, dtype=jnp.int32),
+        jnp.asarray(label_lengths, dtype=jnp.int32),
+    )
+
+
+class PrefetchIterator:
+    """Run host work and host-to-device copies in a background thread."""
+
+    _END = object()
+
+    def __init__(self, iterator, transform_fn, buffer_size: int):
+        self.iterator = iter(iterator)
+        self.transform_fn = transform_fn
+        self.buffer_size = max(int(buffer_size), 1)
+        self.queue = queue.Queue(maxsize=self.buffer_size)
+        self.stop_event = threading.Event()
+        self.worker_error = None
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        try:
+            for item in self.iterator:
+                if self.stop_event.is_set():
+                    break
+                self.queue.put(self.transform_fn(item))
+        except Exception as exc:  # pragma: no cover - surfaced in __next__
+            self.worker_error = exc
+        finally:
+            self._put_end_marker()
+
+    def _put_end_marker(self):
+        while True:
+            try:
+                self.queue.put(self._END, timeout=0.1)
+                return
+            except queue.Full:
+                if self.stop_event.is_set():
+                    try:
+                        self.queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is self._END:
+            if self.worker_error is not None:
+                raise RuntimeError("Prefetch worker failed") from self.worker_error
+            raise StopIteration
+        return item
+
+    def close(self):
+        self.stop_event.set()
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.thread.join(timeout=1.0)
+
+
+def _start_async_host_copy(value):
+    copy_fn = getattr(value, "copy_to_host_async", None)
+    if copy_fn is not None:
+        copy_fn()
+
+
+def _flush_pending_losses(pending_losses, train_losses):
+    if not pending_losses:
+        return None
+    loss_values = [float(loss) for loss in pending_losses]
+    train_losses.extend(loss_values)
+    pending_losses.clear()
+    return loss_values[-1]
+
+
+def ctc_loss(logits, output_lengths, labels, label_lengths, blank_id: int):
+    logit_pad = (jnp.arange(logits.shape[1]) >= output_lengths[:, None]).astype(jnp.float32)
+    label_pad = (jnp.arange(labels.shape[1]) >= label_lengths[:, None]).astype(jnp.float32)
+    logits_f32 = logits.astype(jnp.float32)
+    per_sample_loss = optax.ctc_loss(
+        logits_f32,
+        logit_pad,
+        labels,
+        label_pad,
+        blank_id=blank_id,
+    )
+    return per_sample_loss.mean(), logits_f32, logit_pad
+
+
+@jax.remat
+def entropy_term(logits_f32, frame_mask):
+    log_probs = jax.nn.log_softmax(logits_f32, axis=-1)
+    entropy = -jnp.sum(jnp.exp(log_probs) * log_probs, axis=-1)
+    return (entropy * frame_mask).sum() / jnp.maximum(frame_mask.sum(), 1.0)
+
+
+def build_step_functions(blank_id: int, entropy_weight: float):
+    @nnx.jit
+    def train_step(model, optimizer, audios, labels, audio_lengths, label_lengths, step):
+        def loss_fn(model):
+            logits, output_lengths = model(
+                audios,
+                training=True,
+                inputs_lengths=audio_lengths,
+                step=step,
+            )
+            ctc, logits_f32, logit_pad = ctc_loss(
+                logits,
+                output_lengths,
+                labels,
+                label_lengths,
+                blank_id=blank_id,
+            )
+            entropy_bonus = entropy_term(logits_f32, 1.0 - logit_pad)
+            return ctc - entropy_weight * entropy_bonus
+
+        loss, grads = nnx.value_and_grad(loss_fn)(model)
+        optimizer.update(model=model, grads=grads)
+        return loss
+
+    @nnx.jit
+    def eval_step(model, audios, labels, audio_lengths, label_lengths):
+        logits, output_lengths = model(audios, training=False, inputs_lengths=audio_lengths)
+        loss, _, _ = ctc_loss(logits, output_lengths, labels, label_lengths, blank_id=blank_id)
+        return loss, logits, output_lengths
+
+    return train_step, eval_step
+
+
+class CsvLogger:
+    """Tiny append-only CSV logger."""
+
+    FIELDS = ["step", "epoch", "phase", "loss", "lr", "val_cer"]
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = None
+        self._writer = None
+
+    def __enter__(self):
+        self._fh = self.path.open("w", newline="")
+        self._writer = csv.DictWriter(self._fh, fieldnames=self.FIELDS)
+        self._writer.writeheader()
+        return self
+
+    def __exit__(self, *exc):
+        self._fh.close()
+
+    def log(self, **row):
+        self._writer.writerow({field: row.get(field, "") for field in self.FIELDS})
+        self._fh.flush()
+
+
+def precompile_buckets(args, model, optimizer, train_step):
+    if DEV_MODE:
+        return
+
+    print("Pre-compiling for all buckets...")
+    for bucket_audio_length, bucket_label_length in tqdm(args.bucket_sizes, desc="compile"):
+        dummy_audios = jnp.zeros((args.batch_size, bucket_audio_length), dtype=jnp.float32)
+        dummy_labels = jnp.zeros((args.batch_size, bucket_label_length), dtype=jnp.int32)
+        dummy_audio_lengths = jnp.full((args.batch_size,), bucket_audio_length, dtype=jnp.int32)
+        dummy_label_lengths = jnp.full((args.batch_size,), bucket_label_length, dtype=jnp.int32)
+        train_step.lower(
+            model,
+            optimizer,
+            dummy_audios,
+            dummy_labels,
+            dummy_audio_lengths,
+            dummy_label_lengths,
+            jnp.int32(0),
+        ).compile()
+        print(
+            "  compiled bucket:"
+            f" audio={bucket_audio_length}  labels={bucket_label_length}"
+        )
+
+
+def run_validation(model, test_loader, tokenizer, eval_step):
+    val_losses = []
+    refs = []
+    hyps = []
+
+    for batch in tqdm(test_loader, desc="val"):
+        audios, labels, audio_lengths, label_lengths = to_jax_batch(batch)
+        loss, logits, output_lengths = eval_step(
+            model,
+            audios,
+            labels,
+            audio_lengths,
+            label_lengths,
+        )
+        val_losses.append(float(loss))
+
+        logits_np = np.asarray(logits)
+        output_lengths_np = np.asarray(output_lengths)
+        labels_np = np.asarray(labels)
+        label_lengths_np = np.asarray(label_lengths)
+        for index in range(logits_np.shape[0]):
+            hyps.append(
+                greedy_ctc_decode_text(
+                    logits_np[index],
+                    int(output_lengths_np[index]),
+                    tokenizer,
+                )
+            )
+            refs.append(
+                decode_token_ids(
+                    labels_np[index, : int(label_lengths_np[index])],
+                    tokenizer,
+                )
+            )
+
+    average_loss = mean(val_losses) if val_losses else 0.0
+    average_cer = jiwer.cer(refs, hyps) if refs else 0.0
+    return average_loss, average_cer
+
+
+def main():
+    configure_jax_cache()
+    args = build_training_args()
+    tokenizer = load_tokenizer(args)
+    model = build_model(args, tokenizer)
+
+    train_source, eval_source, steps_per_epoch = build_data_sources(
+        args.data_dir,
+        args.sampling_rate,
+        args.batch_size,
+    )
+    total_steps = steps_per_epoch * args.num_epochs
+    if total_steps <= 0:
+        raise ValueError(
+            "Training dataset produced zero optimization steps. "
+            "Check the packed dataset, duration filters, and batch size."
+        )
+    print(
+        f"train samples: {len(train_source)}  steps/epoch: {steps_per_epoch}  total: {total_steps}"
+    )
+
+    train_loader = build_train_loader(train_source, tokenizer, args, args.num_epochs)
+    eval_loader = build_test_loader(eval_source, tokenizer, args)
+    optimizer, lr_schedule = build_optimizer(args, model, total_steps)
+    checkpoint_manager = create_checkpoint_manager(args)
+    train_step, eval_step = build_step_functions(
+        blank_id=int(tokenizer.blank_id),
+        entropy_weight=float(args.entropy_weight),
+    )
+
+    precompile_buckets(args, model, optimizer, train_step)
+
+    global_step = 0
+    accum_steps = args.grad_accumulation_steps
+    train_iter = PrefetchIterator(
+        train_loader,
+        to_jax_batch,
+        buffer_size=args.device_prefetch_batches,
+    )
+
+    try:
+        with CsvLogger("runs/train.csv") as logger:
+            for epoch_index in range(args.num_epochs):
+                train_losses = []
+                pending_losses = []
+                progress = tqdm(
+                    range(steps_per_epoch),
+                    desc=f"epoch {epoch_index + 1}/{args.num_epochs}",
+                )
+
+                for _ in progress:
+                    audios, labels, audio_lengths, label_lengths = next(train_iter)
+                    loss = train_step(
+                        model,
+                        optimizer,
+                        audios,
+                        labels,
+                        audio_lengths,
+                        label_lengths,
+                        jnp.int32(global_step),
+                    )
+                    _start_async_host_copy(loss)
+                    pending_losses.append(loss)
+                    global_step += 1
+
+                    should_log = global_step % args.log_steps == 0 or global_step < 10
+                    should_save = global_step > 1 and checkpoint_manager.should_save(global_step)
+                    should_sync = (
+                        should_log
+                        or should_save
+                        or len(pending_losses) >= args.loss_sync_steps
+                        or (DEV_MODE and global_step >= DEV_STEPS)
+                    )
+                    loss_value = None
+                    if should_sync:
+                        loss_value = _flush_pending_losses(pending_losses, train_losses)
+
+                    if should_log:
+                        if loss_value is None:
+                            loss_value = _flush_pending_losses(pending_losses, train_losses)
+                        lr_value = float(lr_schedule(global_step // accum_steps))
+                        progress.set_postfix(
+                            loss=f"{loss_value:.4f}",
+                            lr=f"{lr_value:.2e}",
+                            step=global_step,
+                        )
+                        logger.log(
+                            step=global_step,
+                            epoch=epoch_index + 1,
+                            phase="train",
+                            loss=loss_value,
+                            lr=lr_value,
+                        )
+
+                    if should_save:
+                        save_checkpoint(checkpoint_manager, model, optimizer, global_step)
+
+                    if DEV_MODE and global_step >= DEV_STEPS:
+                        break
+
+                _flush_pending_losses(pending_losses, train_losses)
+
+                print(f"\nValidation after epoch {epoch_index + 1}...")
+                val_loss, val_cer = run_validation(model, eval_loader, tokenizer, eval_step)
+                train_loss = mean(train_losses) if train_losses else 0.0
+                print(
+                    f"epoch {epoch_index + 1}  train_loss={train_loss:.4f}  "
+                    f"val_loss={val_loss:.4f}  val_cer={val_cer:.4f}\n"
+                )
+                logger.log(
+                    step=global_step,
+                    epoch=epoch_index + 1,
+                    phase="val",
+                    loss=val_loss,
+                    val_cer=val_cer,
+                )
+
+                if DEV_MODE and global_step >= DEV_STEPS:
+                    break
+    finally:
+        train_iter.close()
+
+    if not checkpoint_manager.should_save(global_step):
+        save_checkpoint(checkpoint_manager, model, optimizer, global_step)
+    checkpoint_manager.wait_until_finished()
+    checkpoint_manager.close()
     print(f"Final checkpoint saved at step {global_step}")
+
+
+if __name__ == "__main__":
+    main()
