@@ -55,13 +55,14 @@ def build_optimizer(args: TrainingArguments, model, total_steps: int):
 def ctc_loss(logits, output_lengths, labels, label_lengths, blank_id: int):
     logit_pad = (jnp.arange(logits.shape[1]) >= output_lengths[:, None]).astype(jnp.float32)
     label_pad = (jnp.arange(labels.shape[1]) >= label_lengths[:, None]).astype(jnp.float32)
-    return optax.ctc_loss(
+    loss = optax.ctc_loss(
         logits.astype(jnp.float32), logit_pad, labels, label_pad, blank_id=blank_id
-    ).mean()
+    )
+    return jnp.where(label_lengths > 0, loss / label_lengths, 0.0).mean()
 
 
 def make_train_step(blank_id: int):
-    @nnx.jit(donate_argnames=("model", "optimizer"))
+    @nnx.jit
     def train_step(model, optimizer, audios, labels, audio_lengths, label_lengths):
         def loss_fn(m):
             logits, output_lengths = m(audios, audio_lengths, training=True)
@@ -82,6 +83,15 @@ def make_eval_step(blank_id: int):
         return loss, logits, output_lengths
 
     return eval_step
+
+
+@jax.jit
+def update_ema_state(ema_state, model_state, decay):
+    return jax.tree_util.tree_map(
+        lambda e, m: e * decay + m * (1.0 - decay),
+        ema_state,
+        model_state,
+    )
 
 
 def run_validation(model, eval_loader, tokenizer, eval_step, max_batches=None):
@@ -130,11 +140,12 @@ class CsvLogger:
         self._fh.flush()
 
 
-def save_checkpoint(manager, model, optimizer, step):
+def save_checkpoint(manager, model, ema_model, optimizer, step):
     manager.save(
         step,
         args=ocp.args.Composite(
             model=ocp.args.StandardSave(nnx.state(model)),
+            ema_model=ocp.args.StandardSave(nnx.state(ema_model)),
             optimizer=ocp.args.StandardSave(nnx.state(optimizer)),
         ),
     )
@@ -154,6 +165,8 @@ def main():
         Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
     )
     model = build_model(args, tokenizer)
+    ema_model = build_model(args, tokenizer)
+    nnx.update(ema_model, nnx.state(model))
 
     train_source, eval_source, steps_per_epoch = build_data_sources(args)
     total_steps = steps_per_epoch * args.num_epochs
@@ -187,6 +200,11 @@ def main():
             for audios, labels, audio_lengths, label_lengths in progress:
                 last_loss = train_step(model, optimizer, audios, labels, audio_lengths, label_lengths)
                 global_step += 1
+                decay = jnp.minimum(0.999, (1.0 + global_step) / (10.0 + global_step))
+                ema_state = nnx.state(ema_model, nnx.Param)
+                model_state = nnx.state(model, nnx.Param)
+                new_ema_state = update_ema_state(ema_state, model_state, decay)
+                nnx.update(ema_model, new_ema_state)
 
                 if global_step % args.log_steps == 0 or global_step < 10:
                     loss_val = float(last_loss)
@@ -196,7 +214,7 @@ def main():
                     logger.log(step=global_step, epoch=epoch + 1, phase="train", loss=loss_val, lr=lr_val)
 
                 if global_step > 1 and manager.should_save(global_step):
-                    save_checkpoint(manager, model, optimizer, global_step)
+                    save_checkpoint(manager, model, ema_model, optimizer, global_step)
                     logger.flush()
 
                 if DEV_MODE and global_step >= DEV_STEPS:
@@ -204,7 +222,7 @@ def main():
 
             print(f"\nValidation after epoch {epoch + 1}...")
             val_loss, val_cer = run_validation(
-                model, eval_loader, tokenizer, eval_step,
+                ema_model, eval_loader, tokenizer, eval_step,
                 max_batches=10 if DEV_MODE else None,
             )
             train_loss = mean(train_losses) if train_losses else 0.0
@@ -216,7 +234,7 @@ def main():
                 break
 
     if not manager.should_save(global_step):
-        save_checkpoint(manager, model, optimizer, global_step)
+        save_checkpoint(manager, model, ema_model, optimizer, global_step)
     manager.wait_until_finished()
     manager.close()
     print(f"Final checkpoint saved at step {global_step}")

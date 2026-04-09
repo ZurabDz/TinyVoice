@@ -57,7 +57,7 @@ class SwiGLUFFN(nnx.Module):
         self.norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
         self.gate = nnx.Linear(d_model, hidden, use_bias=False, rngs=rngs, dtype=dtype)
         self.up = nnx.Linear(d_model, hidden, use_bias=False, rngs=rngs, dtype=dtype)
-        self.down = nnx.Linear(hidden, d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.down = nnx.Linear(hidden, d_model, use_bias=False, rngs=rngs, dtype=dtype, kernel_init=jax.nn.initializers.zeros)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
     def __call__(self, x, training: bool):
@@ -75,7 +75,7 @@ class FlashAttention(nnx.Module):
         self.head_dim = d_model // num_heads
         self.norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
         self.qkv = nnx.Linear(d_model, 3 * d_model, use_bias=False, rngs=rngs, dtype=dtype)
-        self.out = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.out = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype, kernel_init=jax.nn.initializers.zeros)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
     def __call__(self, x, cos, sin, lengths, training: bool):
@@ -112,7 +112,7 @@ class ConvModule(nnx.Module):
             dtype=dtype,
         )
         self.act_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
-        self.pw2 = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.pw2 = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype, kernel_init=jax.nn.initializers.zeros)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
     def __call__(self, x, mask1d, training: bool):
