@@ -8,22 +8,19 @@ from conformer.model import FastConformerEncoder
 
 
 def build_model(args: TrainingArguments, tokenizer) -> FastConformerEncoder:
-    """Construct a FastConformerEncoder from config + tokenizer vocab size."""
     return FastConformerEncoder(
-        token_count=tokenizer.vocab_size,
-        num_layers=args.num_encoder_layers,
+        vocab_size=tokenizer.vocab_size,
         d_model=args.d_model,
+        num_layers=args.num_encoder_layers,
         num_heads=args.num_attention_heads,
-        dropout=args.feed_forward_dropout_p,
-        feed_forward_expansion_factor=args.feed_forward_expansion_factor,
-        conv_kernel_size=args.conv_kernel_size,
-        layer_drop_prob=args.layer_drop_prob,
-        layer_drop_anneal_steps=args.layer_drop_anneal_steps,
-        d_input=args.n_mels,
+        expansion=args.feed_forward_expansion_factor,
+        kernel=args.conv_kernel_size,
+        dropout=args.dropout,
+        n_mels=args.n_mels,
         sample_rate=args.sampling_rate,
         n_fft=args.n_fft,
-        n_window_size=args.win_length,
-        n_window_stride=args.hop_length,
+        win_length=args.win_length,
+        hop_length=args.hop_length,
         dtype=args.dtype,
         rngs=nnx.Rngs(0),
     )

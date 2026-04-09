@@ -5,30 +5,27 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jiwer import cer, wer
 from tqdm.auto import tqdm
 
 from conformer.config import TrainingArguments
-from conformer.dataset import build_data_sources, build_test_loader
+from conformer.dataset import build_data_sources, build_eval_loader
 from conformer.decode import decode_token_ids, greedy_ctc_decode_text
 from conformer.factory import build_model, load_checkpoint
 from conformer.tokenizer import Tokenizer
 
 
-def to_jax_batch(batch):
-    audios, labels, audio_lengths, label_lengths = batch
-    return (
-        jnp.asarray(audios, dtype=jnp.float32),
-        jnp.asarray(labels, dtype=jnp.int32),
-        jnp.asarray(audio_lengths, dtype=jnp.int32),
-        jnp.asarray(label_lengths, dtype=jnp.int32),
-    )
+@nnx.jit
+def forward(model, audios, audio_lengths):
+    return model(audios, audio_lengths, training=False)
 
 
 def main():
     args = TrainingArguments()
-    tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
-    tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
+    tokenizer = Tokenizer.load_tokenizer(
+        Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
+    )
 
     model = build_model(args, tokenizer)
     model, latest_step = load_checkpoint(model, args.checkpoint_dir)
@@ -37,43 +34,25 @@ def main():
         return
     print(f"Restored checkpoint step {latest_step}")
 
-    _, test_source, _ = build_data_sources(
-        args.data_dir,
-        args.sampling_rate,
-        args.batch_size,
-        eval_split="test",
-    )
-    test_loader = build_test_loader(test_source, tokenizer, args)
+    _, test_source, _ = build_data_sources(args, eval_split="test")
+    test_loader = build_eval_loader(test_source, tokenizer, args)
 
-    refs = []
-    hyps = []
-
+    refs, hyps = [], []
     with open("transcribe.txt", "w", encoding="utf-8") as fh:
-        for batch_index, batch in enumerate(tqdm(test_loader, desc="Inference")):
-            audios, labels, audio_lengths, label_lengths = to_jax_batch(batch)
-            logits, output_lengths = model(audios, training=False, inputs_lengths=audio_lengths)
-
+        for batch_index, (audios, labels, audio_lengths, label_lengths) in enumerate(
+            tqdm(test_loader, desc="Inference")
+        ):
+            logits, output_lengths = forward(model, jnp.asarray(audios), jnp.asarray(audio_lengths))
             logits_np = np.asarray(logits)
-            output_lengths_np = np.asarray(output_lengths)
-            labels_np = np.asarray(labels)
-            label_lengths_np = np.asarray(label_lengths)
-
-            for sample_index in range(logits_np.shape[0]):
-                pred_text = greedy_ctc_decode_text(
-                    logits_np[sample_index],
-                    int(output_lengths_np[sample_index]),
-                    tokenizer,
-                )
-                gt_text = decode_token_ids(
-                    labels_np[sample_index, : int(label_lengths_np[sample_index])],
-                    tokenizer,
-                )
-                sample_number = batch_index * args.batch_size + sample_index + 1
-                fh.write(f"\nSample {sample_number}:\n")
-                fh.write(f"Ground Truth: {gt_text}\n")
-                fh.write(f"Prediction:   {pred_text}\n")
-                refs.append(gt_text)
-                hyps.append(pred_text)
+            out_lens = np.asarray(output_lengths)
+            for i in range(logits_np.shape[0]):
+                pred = greedy_ctc_decode_text(logits_np[i], int(out_lens[i]), tokenizer)
+                gt = decode_token_ids(labels[i, : int(label_lengths[i])], tokenizer)
+                fh.write(f"\nSample {batch_index * args.batch_size + i + 1}:\n")
+                fh.write(f"Ground Truth: {gt}\n")
+                fh.write(f"Prediction:   {pred}\n")
+                refs.append(gt)
+                hyps.append(pred)
 
     print("WER:", wer(refs, hyps))
     print("CER:", cer(refs, hyps))

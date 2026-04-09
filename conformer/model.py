@@ -7,247 +7,216 @@ from flax import nnx
 from .mel import AudioToMelSpectrogram
 
 
-class Conv2dSubSampler(nnx.Module):
-    """Two stride-2 convs producing a 4x time downsample."""
+def _rope_table(head_dim: int, max_len: int, dtype):
+    inv = 1.0 / (10000.0 ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    t = jnp.arange(max_len, dtype=jnp.float32)
+    freqs = jnp.einsum("i,j->ij", t, inv)
+    emb = jnp.concatenate([freqs, freqs], axis=-1)  # (T, head_dim)
+    return jnp.cos(emb).astype(dtype), jnp.sin(emb).astype(dtype)
 
-    def __init__(self, d_model, rngs: nnx.Rngs, dtype=jnp.float32):
-        kw = dict(strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype)
-        self.conv1 = nnx.Conv(1, d_model // 4, (3, 3), **kw)
-        self.conv2 = nnx.Conv(d_model // 4, d_model, (3, 3), **kw)
 
-    def get_length(self, seq_len):
-        seq_len = (seq_len - 3) // 2 + 1
-        seq_len = (seq_len - 3) // 2 + 1
-        return jnp.maximum(seq_len, 0)
+def _apply_rope(x, cos, sin):  # x: (B, T, H, D)
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    cos_h = cos[None, :, None, :half]
+    sin_h = sin[None, :, None, :half]
+    return jnp.concatenate(
+        [x1 * cos_h - x2 * sin_h, x1 * sin_h + x2 * cos_h], axis=-1
+    )
 
-    def __call__(self, x):
-        x = nnx.silu(self.conv1(x))
+
+class ConvSubsampler(nnx.Module):
+    """Two stride-2 2D convs giving a 4× time downsample."""
+
+    def __init__(self, d_model: int, *, rngs: nnx.Rngs, dtype):
+        self.conv1 = nnx.Conv(
+            1, d_model // 4, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype
+        )
+        self.conv2 = nnx.Conv(
+            d_model // 4, d_model, (3, 3), strides=(2, 2), padding="VALID", rngs=rngs, dtype=dtype
+        )
+
+    @staticmethod
+    def output_length(t):
+        t = (t - 3) // 2 + 1
+        t = (t - 3) // 2 + 1
+        return jnp.maximum(t, 0)
+
+    def __call__(self, x):  # (B, T, F)
+        x = nnx.silu(self.conv1(x[..., None]))
         x = nnx.silu(self.conv2(x))
         B, T, F, C = x.shape
         return x.reshape(B, T, F * C)
 
 
-class RotaryEmbedding(nnx.Module):
-    def __init__(self, dim: int):
-        inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-        self.inv_freq = jnp.array(inv_freq, dtype=jnp.float32)
+class SwiGLUFFN(nnx.Module):
+    """Pre-norm SwiGLU feed-forward — half-residual macaroon contribution."""
 
-    def __call__(self, x):  # x: (B, T, H, D)
-        t = jnp.arange(x.shape[1], dtype=jnp.float32)
-        freqs = jnp.einsum("i,j->ij", t, self.inv_freq)
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
-        cos = jnp.cos(emb)[None, :, None, :].astype(x.dtype)
-        sin = jnp.sin(emb)[None, :, None, :].astype(x.dtype)
-        return cos, sin
-
-
-def apply_rotary_emb(q, k, cos, sin):
-    d = q.shape[-1] // 2
-    q1, q2 = q[..., :d], q[..., d:]
-    k1, k2 = k[..., :d], k[..., d:]
-    cos_h, sin_h = cos[..., :d], sin[..., :d]
-    q_out = jnp.concatenate([q1 * cos_h - q2 * sin_h, q1 * sin_h + q2 * cos_h], axis=-1)
-    k_out = jnp.concatenate([k1 * cos_h - k2 * sin_h, k1 * sin_h + k2 * cos_h], axis=-1)
-    return q_out, k_out
-
-
-class FastConformerFFN(nnx.Module):
-    def __init__(self, d_model, expansion, dropout, rngs: nnx.Rngs, dtype=jnp.float32):
-        self.norm = nnx.LayerNorm(d_model, rngs=rngs)
-        self.lin1 = nnx.Linear(d_model, d_model * expansion, rngs=rngs, dtype=dtype)
-        self.lin2 = nnx.Linear(d_model * expansion, d_model, rngs=rngs, dtype=dtype)
+    def __init__(self, d_model: int, expansion: int, dropout: float, *, rngs: nnx.Rngs, dtype):
+        hidden = d_model * expansion // 2
+        self.norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.gate = nnx.Linear(d_model, hidden, use_bias=False, rngs=rngs, dtype=dtype)
+        self.up = nnx.Linear(d_model, hidden, use_bias=False, rngs=rngs, dtype=dtype)
+        self.down = nnx.Linear(hidden, d_model, use_bias=False, rngs=rngs, dtype=dtype)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
-    def __call__(self, x, training=True):
-        residual = x
-        x = self.norm(x)
-        x = nnx.silu(self.lin1(x))
-        x = self.drop(x, deterministic=not training)
-        x = self.lin2(x)
-        x = self.drop(x, deterministic=not training)
-        return residual + 0.5 * x
+    def __call__(self, x, training: bool):
+        h = self.norm(x)
+        h = nnx.silu(self.gate(h)) * self.up(h)
+        return self.drop(self.down(h), deterministic=not training)
 
 
-class FastConformerMHSA(nnx.Module):
-    def __init__(self, d_model, num_heads, dropout, rngs: nnx.Rngs, dtype=jnp.float32):
+class FlashAttention(nnx.Module):
+    """Pre-norm MHSA over fused QKV with RoPE and cuDNN flash attention."""
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float, *, rngs: nnx.Rngs, dtype):
+        assert d_model % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.norm = nnx.LayerNorm(d_model, rngs=rngs)
-        self.q_proj = nnx.Linear(d_model, d_model, rngs=rngs, dtype=dtype)
-        self.k_proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
-        self.v_proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
-        self.out_proj = nnx.Linear(d_model, d_model, rngs=rngs, dtype=dtype)
+        self.norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.qkv = nnx.Linear(d_model, 3 * d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.out = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
-        self.rope = RotaryEmbedding(self.head_dim)
 
-    def __call__(self, x, mask=None, training=True):
-        residual = x
-        x = self.norm(x)
-        B, T, D = x.shape
-        H, d = self.num_heads, self.head_dim
-
-        q = self.q_proj(x).reshape(B, T, H, d)
-        k = self.k_proj(x).reshape(B, T, H, d)
-        v = self.v_proj(x).reshape(B, T, H, d)
-
-        cos, sin = self.rope(q)
-        q, k = apply_rotary_emb(q, k, cos, sin)
-
-        scores = jnp.einsum("bthd,bshd->bhts", q, k) * self.scale
-        if mask is not None:
-            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
-
-        attn = jax.nn.softmax(scores, axis=-1)
-        attn = self.drop(attn, deterministic=not training)
-
-        out = jnp.einsum("bhts,bshd->bthd", attn, v).reshape(B, T, D)
-        return residual + self.drop(self.out_proj(out), deterministic=not training)
+    def __call__(self, x, cos, sin, lengths, training: bool):
+        B, T, _ = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).reshape(B, T, 3, self.num_heads, self.head_dim)
+        q = _apply_rope(qkv[:, :, 0], cos, sin)
+        k = _apply_rope(qkv[:, :, 1], cos, sin)
+        v = qkv[:, :, 2]
+        out = jax.nn.dot_product_attention(
+            q, k, v,
+            query_seq_lengths=lengths,
+            key_value_seq_lengths=lengths,
+            implementation="cudnn",
+        )
+        out = out.reshape(B, T, -1)
+        return self.drop(self.out(out), deterministic=not training)
 
 
-class FastConformerConvModule(nnx.Module):
-    def __init__(self, d_model, kernel_size, dropout, rngs: nnx.Rngs, dtype=jnp.float32):
-        self.norm = nnx.LayerNorm(d_model, rngs=rngs)
-        self.pw1 = nnx.Conv(d_model, d_model * 2, (1,), rngs=rngs, dtype=dtype)
+class ConvModule(nnx.Module):
+    """Pre-norm pointwise→GLU→depthwise→activation→pointwise convolution module."""
+
+    def __init__(self, d_model: int, kernel: int, dropout: float, *, rngs: nnx.Rngs, dtype):
+        self.norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.pw1 = nnx.Linear(d_model, 2 * d_model, use_bias=False, rngs=rngs, dtype=dtype)
         self.dw = nnx.Conv(
             d_model,
             d_model,
-            (kernel_size,),
+            (kernel,),
             feature_group_count=d_model,
             padding="SAME",
+            use_bias=False,
             rngs=rngs,
             dtype=dtype,
         )
-        self.post_norm = nnx.LayerNorm(d_model, rngs=rngs)
-        self.pw2 = nnx.Conv(d_model, d_model, (1,), rngs=rngs, dtype=dtype)
+        self.act_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.pw2 = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
-    def __call__(self, x, mask=None, training=True):
-        residual = x
-        x = self.norm(x)
-        x = nnx.glu(self.pw1(x))
-        if mask is not None:
-            m = mask[:, 0, 0, :, None].astype(x.dtype)
-            x = x * m
-        x = nnx.silu(self.post_norm(self.dw(x)))
-        if mask is not None:
-            x = x * m
-        x = self.drop(self.pw2(x), deterministic=not training)
-        return residual + x
+    def __call__(self, x, mask1d, training: bool):
+        h = self.norm(x)
+        h = nnx.glu(self.pw1(h), axis=-1)
+        h = h * mask1d
+        h = self.dw(h)
+        h = nnx.silu(self.act_norm(h))
+        h = self.pw2(h)
+        return self.drop(h, deterministic=not training)
 
 
 class FastConformerBlock(nnx.Module):
+    """Macaroon: ½·FFN → MHSA → Conv → ½·FFN."""
+
     def __init__(
         self,
-        d_model,
-        num_heads,
-        expansion,
-        conv_kernel,
-        dropout,
-        drop_prob,
-        rngs,
-        dtype=jnp.float32,
-        drop_anneal_steps=5000,
+        d_model: int,
+        num_heads: int,
+        expansion: int,
+        kernel: int,
+        dropout: float,
+        *,
+        rngs: nnx.Rngs,
+        dtype,
     ):
-        self.ff1 = FastConformerFFN(d_model, expansion, dropout, rngs, dtype)
-        self.attn = FastConformerMHSA(d_model, num_heads, dropout, rngs, dtype)
-        self.conv = FastConformerConvModule(d_model, conv_kernel, dropout, rngs, dtype)
-        self.ff2 = FastConformerFFN(d_model, expansion, dropout, rngs, dtype)
-        self.norm = nnx.LayerNorm(d_model, rngs=rngs)
-        self.drop_prob = drop_prob
-        self.drop_anneal_steps = drop_anneal_steps
-        self.rngs = rngs
+        self.ff1 = SwiGLUFFN(d_model, expansion, dropout, rngs=rngs, dtype=dtype)
+        self.attn = FlashAttention(d_model, num_heads, dropout, rngs=rngs, dtype=dtype)
+        self.conv = ConvModule(d_model, kernel, dropout, rngs=rngs, dtype=dtype)
+        self.ff2 = SwiGLUFFN(d_model, expansion, dropout, rngs=rngs, dtype=dtype)
 
-    def __call__(self, x, mask=None, training=True, step=None):
-        x_in = x
-        x = self.ff1(x, training=training)
-        x = self.attn(x, mask=mask, training=training)
-        x = self.conv(x, mask=mask, training=training)
-        x = self.ff2(x, training=training)
-        x = self.norm(x)
-        if training and self.drop_prob > 0.0:
-            drop_prob = self.drop_prob
-            if step is not None:
-                drop_prob = self.drop_prob * jnp.minimum(step / float(self.drop_anneal_steps), 1.0)
-            keep = jax.random.bernoulli(self.rngs.dropout(), 1.0 - drop_prob)
-            return jnp.where(keep, x, x_in)
+    def __call__(self, x, cos, sin, lengths, mask1d, training: bool):
+        x = x + 0.5 * self.ff1(x, training)
+        x = x + self.attn(x, cos, sin, lengths, training)
+        x = x + self.conv(x, mask1d, training)
+        x = x + 0.5 * self.ff2(x, training)
         return x
 
 
-@nnx.remat(static_argnums=(3,))
-def remat_block_forward(block, x, mask, training, step):
-    return block(x, mask=mask, training=training, step=step)
-
-
 class FastConformerEncoder(nnx.Module):
-    """FastConformer encoder with an internal log-mel frontend."""
+    """FastConformer encoder: log-mel → 4× subsample → N scanned blocks → CTC head."""
 
     def __init__(
         self,
-        token_count,
-        d_input=128,
-        d_model=256,
-        num_layers=6,
-        feed_forward_expansion_factor=4,
-        num_heads=4,
-        conv_kernel_size=9,
-        dropout=0.1,
-        layer_drop_prob=0.1,
-        rngs=None,
-        dtype=jnp.float32,
-        layer_drop_anneal_steps=5000,
-        **featurizer_kwargs,
+        vocab_size: int,
+        *,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        expansion: int,
+        kernel: int,
+        dropout: float,
+        n_mels: int,
+        sample_rate: int,
+        n_fft: int,
+        win_length: int,
+        hop_length: int,
+        dtype,
+        rngs: nnx.Rngs,
     ):
-        if rngs is None:
-            rngs = nnx.Rngs(0)
-
-        self.mel_spectrogram = AudioToMelSpectrogram(
-            n_mels=d_input,
-            rng=rngs,
-            normalize=True,
+        self.frontend = AudioToMelSpectrogram(
+            sample_rate=sample_rate,
+            n_window_size=win_length,
+            n_window_stride=hop_length,
+            n_fft=n_fft,
+            n_mels=n_mels,
+            rngs=rngs,
             spec_augment=True,
-            pitch_shift=True,
-            **featurizer_kwargs,
         )
+        self.subsampler = ConvSubsampler(d_model, rngs=rngs, dtype=dtype)
+        freq_dim = ((n_mels - 3) // 2 + 1 - 3) // 2 + 1
+        self.proj = nnx.Linear(d_model * freq_dim, d_model, rngs=rngs, dtype=dtype)
 
-        self.conv_subsampler = Conv2dSubSampler(d_model, rngs, dtype)
-        freq_dim = ((d_input - 3) // 2 + 1 - 3) // 2 + 1
-        self.linear_proj = nnx.Linear(d_model * freq_dim, d_model, rngs=rngs, dtype=dtype)
+        @nnx.split_rngs(splits=num_layers)
+        @nnx.vmap(in_axes=0, out_axes=0)
+        def make_block(rngs):
+            return FastConformerBlock(
+                d_model, num_heads, expansion, kernel, dropout, rngs=rngs, dtype=dtype
+            )
 
-        self.layers = nnx.List(
-            [
-                FastConformerBlock(
-                    d_model,
-                    num_heads,
-                    feed_forward_expansion_factor,
-                    conv_kernel_size,
-                    dropout,
-                    layer_drop_prob,
-                    rngs,
-                    dtype,
-                    drop_anneal_steps=layer_drop_anneal_steps,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.decoder = nnx.Linear(d_model, token_count, rngs=rngs, dtype=dtype)
+        self.blocks = make_block(rngs)
+        self.final_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.head = nnx.Linear(d_model, vocab_size, rngs=rngs, dtype=dtype)
+
         self.d_model = d_model
+        self.head_dim = d_model // num_heads
+        self.dtype = dtype
 
-    def _build_padding_mask(self, lengths, max_length):
-        return (jnp.arange(max_length)[None, :] < lengths[:, None])[:, None, None, :]
+    def __call__(self, audio, audio_lengths, training: bool = True):
+        mel, mel_lengths = self.frontend(audio, audio_lengths, training=training)
+        x = jnp.transpose(mel, (0, 2, 1))  # (B, T_mel, F_mel)
+        seq_len = self.subsampler.output_length(mel_lengths)
+        x = self.subsampler(x)
+        x = self.proj(x) * math.sqrt(self.d_model)
 
-    def __call__(self, x, mask=None, training=True, inputs_lengths=None, step=None):
-        x, seq_len = self.mel_spectrogram(x, lengths=inputs_lengths, training=training)
-        x = jnp.transpose(x, (0, 2, 1))
+        T = x.shape[1]
+        cos, sin = _rope_table(self.head_dim, T, self.dtype)
+        mask1d = (jnp.arange(T)[None, :] < seq_len[:, None])[:, :, None].astype(x.dtype)
 
-        seq_len = self.conv_subsampler.get_length(seq_len)
-        x = self.conv_subsampler(x[:, :, :, None])
-        x = self.linear_proj(x) * math.sqrt(self.d_model)
+        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+        @nnx.remat
+        def run(x, block):
+            return block(x, cos, sin, seq_len, mask1d, training)
 
-        if mask is None and inputs_lengths is not None:
-            mask = self._build_padding_mask(seq_len, x.shape[1])
-
-        for layer in self.layers:
-            x = remat_block_forward(layer, x, mask, training, step)
-
-        return self.decoder(x), seq_len
+        x = run(x, self.blocks)
+        x = self.final_norm(x)
+        return self.head(x), seq_len

@@ -7,11 +7,17 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import jax.numpy as jnp
 import librosa
 import numpy as np
+from flax import nnx
 
 from conformer.config import TrainingArguments
 from conformer.decode import greedy_ctc_decode_text
 from conformer.factory import build_model, load_checkpoint
 from conformer.tokenizer import Tokenizer
+
+
+@nnx.jit
+def forward(model, audios, audio_lengths):
+    return model(audios, audio_lengths, training=False)
 
 
 def main():
@@ -21,8 +27,9 @@ def main():
 
     audio_path = sys.argv[1]
     args = TrainingArguments()
-    tokenizer_path = Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
-    tokenizer = Tokenizer.load_tokenizer(tokenizer_path)
+    tokenizer = Tokenizer.load_tokenizer(
+        Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
+    )
 
     model = build_model(args, tokenizer)
     model, latest_step = load_checkpoint(model, args.checkpoint_dir)
@@ -35,15 +42,11 @@ def main():
     audio = np.asarray(audio, dtype=np.float32)
     print(f"Audio: {len(audio) / args.sampling_rate:.2f}s")
 
-    padded_audios = jnp.zeros((1, len(audio)), dtype=jnp.float32).at[0, : len(audio)].set(audio)
-    audio_lengths = jnp.array([len(audio)], dtype=jnp.int32)
-    logits, output_lengths = model(padded_audios, training=False, inputs_lengths=audio_lengths)
+    audios = jnp.asarray(audio[None, :])
+    audio_lengths = jnp.asarray([len(audio)], dtype=jnp.int32)
+    logits, output_lengths = forward(model, audios, audio_lengths)
 
-    text = greedy_ctc_decode_text(
-        np.asarray(logits[0]),
-        int(output_lengths[0]),
-        tokenizer,
-    )
+    text = greedy_ctc_decode_text(np.asarray(logits[0]), int(output_lengths[0]), tokenizer)
     print(f"\nTranscription: {text}")
 
 
