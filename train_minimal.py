@@ -1,6 +1,7 @@
 """Minimal end-to-end CTC training for the FastConformer ASR encoder."""
 
 import csv
+import itertools
 import os
 from pathlib import Path
 from statistics import mean
@@ -60,49 +61,57 @@ def ctc_loss(logits, output_lengths, labels, label_lengths, blank_id: int):
     )
     return jnp.where(label_lengths > 0, loss / label_lengths, 0.0).mean()
 
+class Trainer(nnx.Module):
+    def __init__(self, model, optimizer, ema_model, blank_id: int, schedule):
+        self.model = model
+        self.optimizer = optimizer
+        self.ema_model = ema_model
+        self.blank_id = blank_id
+        self.schedule = schedule
+        self.step = nnx.Variable(jnp.array(0, dtype=jnp.int32))
 
-def make_train_step(blank_id: int):
     @nnx.jit
-    def train_step(model, optimizer, audios, labels, audio_lengths, label_lengths):
+    def train_step(self, audios, labels, audio_lengths, label_lengths):
         def loss_fn(m):
             logits, output_lengths = m(audios, audio_lengths, training=True)
-            return ctc_loss(logits, output_lengths, labels, label_lengths, blank_id)
+            return ctc_loss(logits, output_lengths, labels, label_lengths, self.blank_id)
 
-        loss, grads = nnx.value_and_grad(loss_fn)(model)
-        optimizer.update(model, grads)
+        loss, grads = nnx.value_and_grad(loss_fn)(self.model)
+        self.optimizer.update(self.model, grads)
+
+        self.step[...] += 1
+        step = self.step[...]
+
+        # EMA update
+        decay = jnp.minimum(0.999, (1.0 + step) / (10.0 + step))
+        ema_params = nnx.state(self.ema_model, nnx.Param)
+        model_params = nnx.state(self.model, nnx.Param)
+        new_ema_params = jax.tree_util.tree_map(
+            lambda e, m: e * decay + m * (1.0 - decay),
+            ema_params,
+            model_params,
+        )
+        nnx.update(self.ema_model, new_ema_params)
+
         return loss
 
-    return train_step
+
+@nnx.jit(static_argnames="blank_id")
+def eval_step(model, audios, labels, audio_lengths, label_lengths, blank_id: int):
+    logits, output_lengths = model(audios, audio_lengths, training=False)
+    loss = ctc_loss(logits, output_lengths, labels, label_lengths, blank_id)
+    return loss, logits, output_lengths
 
 
-def make_eval_step(blank_id: int):
-    @nnx.jit
-    def eval_step(model, audios, labels, audio_lengths, label_lengths):
-        logits, output_lengths = model(audios, audio_lengths, training=False)
-        loss = ctc_loss(logits, output_lengths, labels, label_lengths, blank_id)
-        return loss, logits, output_lengths
-
-    return eval_step
-
-
-@jax.jit
-def update_ema_state(ema_state, model_state, decay):
-    return jax.tree_util.tree_map(
-        lambda e, m: e * decay + m * (1.0 - decay),
-        ema_state,
-        model_state,
-    )
-
-
-def run_validation(model, eval_loader, tokenizer, eval_step, max_batches=None):
+def run_validation(model, eval_loader, tokenizer, blank_id: int, max_batches=None):
     losses, refs, hyps = [], [], []
     for index, (audios, labels, audio_lengths, label_lengths) in enumerate(
-        tqdm(eval_loader, desc="val")
+        tqdm(eval_loader, desc="val", leave=False)
     ):
         if max_batches is not None and index >= max_batches:
             break
         loss, logits, output_lengths = eval_step(
-            model, audios, labels, audio_lengths, label_lengths
+            model, audios, labels, audio_lengths, label_lengths, blank_id
         )
         losses.append(float(loss))
         logits_np = np.asarray(logits)
@@ -140,15 +149,27 @@ class CsvLogger:
         self._fh.flush()
 
 
-def save_checkpoint(manager, model, ema_model, optimizer, step):
+def save_checkpoint(manager, trainer, step):
     manager.save(
         step,
         args=ocp.args.Composite(
-            model=ocp.args.StandardSave(nnx.state(model)),
-            ema_model=ocp.args.StandardSave(nnx.state(ema_model)),
-            optimizer=ocp.args.StandardSave(nnx.state(optimizer)),
+            trainer=ocp.args.StandardSave(nnx.state(trainer)),
         ),
     )
+
+
+def restore_checkpoint(manager, trainer):
+    latest = manager.latest_step()
+    if latest is not None:
+        restored = manager.restore(
+            latest,
+            args=ocp.args.Composite(
+                trainer=ocp.args.StandardRestore(nnx.state(trainer)),
+            ),
+        )
+        nnx.update(trainer, restored.trainer)
+        return latest
+    return 0
 
 
 def main():
@@ -178,8 +199,7 @@ def main():
     eval_loader = build_eval_loader(eval_source, tokenizer, args)
     optimizer, schedule = build_optimizer(args, model, total_steps)
 
-    train_step = make_train_step(int(tokenizer.blank_id))
-    eval_step = make_eval_step(int(tokenizer.blank_id))
+    trainer = Trainer(model, optimizer, ema_model, int(tokenizer.blank_id), schedule)
 
     manager = ocp.CheckpointManager(
         os.path.abspath(args.checkpoint_dir),
@@ -189,40 +209,57 @@ def main():
         ),
     )
 
-    global_step = 0
-    last_loss = None
+    restored_step = restore_checkpoint(manager, trainer)
+    if restored_step > 0:
+        print(f"Restored from checkpoint at step {restored_step}")
+    
+    # Calculate starting epoch and remaining steps if needed
+    # But with Grain repeated dataset, we can just skip if we wanted to.
+    # For simplicity in this minimal script, we start from the current global step.
+    
+    train_loader_iter = iter(train_loader)
+    # If we restored, we might want to skip batches, but Grain MapDataset is better for that.
+    # Here we just continue.
+
+    global_step = int(trainer.step[...])
 
     with CsvLogger("runs/train.csv") as logger:
-        for epoch in range(args.num_epochs):
+        for epoch in range(global_step // steps_per_epoch, args.num_epochs):
             train_losses = []
-            progress = tqdm(train_loader, total=steps_per_epoch, desc=f"epoch {epoch + 1}/{args.num_epochs}")
+            
+            # Slice the iterator for the current epoch
+            remaining_steps = steps_per_epoch - (global_step % steps_per_epoch)
+            epoch_iter = itertools.islice(train_loader_iter, remaining_steps)
+            
+            progress = tqdm(
+                epoch_iter, 
+                total=steps_per_epoch, 
+                desc=f"epoch {epoch + 1}/{args.num_epochs}",
+                initial=global_step % steps_per_epoch
+            )
 
             for audios, labels, audio_lengths, label_lengths in progress:
-                last_loss = train_step(model, optimizer, audios, labels, audio_lengths, label_lengths)
-                global_step += 1
-                decay = jnp.minimum(0.999, (1.0 + global_step) / (10.0 + global_step))
-                ema_state = nnx.state(ema_model, nnx.Param)
-                model_state = nnx.state(model, nnx.Param)
-                new_ema_state = update_ema_state(ema_state, model_state, decay)
-                nnx.update(ema_model, new_ema_state)
-
+                loss = trainer.train_step(audios, labels, audio_lengths, label_lengths)
+                global_step = int(trainer.step[...])
+                
                 if global_step % args.log_steps == 0 or global_step < 10:
-                    loss_val = float(last_loss)
+                    loss_val = float(loss)
                     train_losses.append(loss_val)
                     lr_val = float(schedule(global_step))
                     progress.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr_val:.2e}", step=global_step)
                     logger.log(step=global_step, epoch=epoch + 1, phase="train", loss=loss_val, lr=lr_val)
 
-                if global_step > 1 and manager.should_save(global_step):
-                    save_checkpoint(manager, model, ema_model, optimizer, global_step)
+                if global_step > 0 and manager.should_save(global_step):
+                    save_checkpoint(manager, trainer, global_step)
                     logger.flush()
 
                 if DEV_MODE and global_step >= DEV_STEPS:
                     break
 
+            # Run validation at the end of epoch
             print(f"\nValidation after epoch {epoch + 1}...")
             val_loss, val_cer = run_validation(
-                ema_model, eval_loader, tokenizer, eval_step,
+                trainer.ema_model, eval_loader, tokenizer, trainer.blank_id,
                 max_batches=10 if DEV_MODE else None,
             )
             train_loss = mean(train_losses) if train_losses else 0.0
@@ -234,7 +271,7 @@ def main():
                 break
 
     if not manager.should_save(global_step):
-        save_checkpoint(manager, model, ema_model, optimizer, global_step)
+        save_checkpoint(manager, trainer, global_step)
     manager.wait_until_finished()
     manager.close()
     print(f"Final checkpoint saved at step {global_step}")
