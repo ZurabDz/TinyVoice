@@ -28,7 +28,7 @@ def main():
     audio_path = sys.argv[1]
     args = TrainingArguments()
     tokenizer = Tokenizer.load_tokenizer(
-        Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
+        Path(args.data_dir) / "tokenizer.pkl"
     )
 
     model = build_model(args, tokenizer)

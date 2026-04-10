@@ -6,6 +6,8 @@ from flax import nnx
 
 from .mel import AudioToMelSpectrogram
 
+_ATTN_IMPL = "cudnn" if jax.devices()[0].platform == "gpu" else None
+
 
 def _rope_table(head_dim: int, max_len: int, dtype):
     inv = 1.0 / (10000.0 ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
@@ -89,7 +91,7 @@ class FlashAttention(nnx.Module):
             q, k, v,
             query_seq_lengths=lengths,
             key_value_seq_lengths=lengths,
-            implementation="cudnn",
+            implementation=_ATTN_IMPL,
         )
         out = out.reshape(B, T, -1)
         return self.drop(self.out(out), deterministic=not training)

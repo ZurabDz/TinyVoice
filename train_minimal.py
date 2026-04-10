@@ -183,7 +183,7 @@ def main():
     print(f"dtype={args.dtype}  shape=({args.audio_frames_max},{args.label_length_max})")
 
     tokenizer = Tokenizer.load_tokenizer(
-        Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
+        Path(args.data_dir) / "tokenizer.pkl"
     )
     model = build_model(args, tokenizer)
     ema_model = build_model(args, tokenizer)

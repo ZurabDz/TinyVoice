@@ -133,7 +133,7 @@ def _pad_and_collate(batch, audio_frames_max: int, label_length_max: int, pad_id
 
 def _open_source(data_dir: str, split: str) -> grain.sources.ArrayRecordDataSource:
     return grain.sources.ArrayRecordDataSource(
-        str(Path(data_dir) / "packed_dataset" / f"{split}.array_record")
+        str(Path(data_dir) / f"{split}.array_record")
     )
 
 

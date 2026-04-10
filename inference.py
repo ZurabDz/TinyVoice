@@ -24,7 +24,7 @@ def forward(model, audios, audio_lengths):
 def main():
     args = TrainingArguments()
     tokenizer = Tokenizer.load_tokenizer(
-        Path(args.data_dir) / "packed_dataset" / "tokenizer.pkl"
+        Path(args.data_dir) / "tokenizer.pkl"
     )
 
     model = build_model(args, tokenizer)
