@@ -4,18 +4,21 @@ import orbax.checkpoint as ocp
 from flax import nnx
 
 from conformer.config import TrainingArguments
-from conformer.model import FastConformerEncoder
+from conformer.model import FastConformer
 
 
-def build_model(args: TrainingArguments, tokenizer) -> FastConformerEncoder:
-    return FastConformerEncoder(
+def build_model(args: TrainingArguments, tokenizer) -> FastConformer:
+    return FastConformer(
         vocab_size=tokenizer.vocab_size,
         d_model=args.d_model,
-        num_layers=args.num_encoder_layers,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.decoder_layers,
         num_heads=args.num_attention_heads,
         expansion=args.feed_forward_expansion_factor,
         kernel=args.conv_kernel_size,
         dropout=args.dropout,
+        stochastic_depth_prob=args.stochastic_depth_prob,
+        interctc_layer=args.interctc_layer,
         n_mels=args.n_mels,
         sample_rate=args.sampling_rate,
         n_fft=args.n_fft,

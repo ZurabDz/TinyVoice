@@ -44,9 +44,11 @@ def main():
 
     audios = jnp.asarray(audio[None, :])
     audio_lengths = jnp.asarray([len(audio)], dtype=jnp.int32)
-    logits, output_lengths = forward(model, audios, audio_lengths)
+    out = forward(model, audios, audio_lengths)
 
-    text = greedy_ctc_decode_text(np.asarray(logits[0]), int(output_lengths[0]), tokenizer)
+    text = greedy_ctc_decode_text(
+        np.asarray(out["logits"][0]), int(out["output_lengths"][0]), tokenizer
+    )
     print(f"\nTranscription: {text}")
 
 

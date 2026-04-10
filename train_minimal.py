@@ -31,10 +31,14 @@ def configure_jax_cache():
 
 
 def build_optimizer(args: TrainingArguments, model, total_steps: int):
+    # SOTA FastConformer Recipe: 15k warmup, 1e-3 peak LR, Cosine Decay
+    warmup_steps = 15000
+    peak_lr = 1e-3
+    
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=args.lr_init_value,
-        peak_value=args.lr_peak_value,
-        warmup_steps=min(args.lr_warmup_steps, max(total_steps - 1, 1)),
+        peak_value=peak_lr,
+        warmup_steps=min(warmup_steps, max(total_steps - 1, 1)),
         decay_steps=total_steps,
         end_value=args.lr_end_value,
     )
@@ -60,12 +64,49 @@ def ctc_loss(logits, output_lengths, labels, label_lengths, blank_id: int):
     ).mean()
 
 
-def make_train_step(blank_id: int):
+def cross_entropy_loss(logits, labels, label_lengths, smoothing: float = 0.1):
+    """Label-smoothed cross-entropy for the decoder."""
+    B, T, V = logits.shape
+    one_hot = jax.nn.one_hot(labels, V)
+    if smoothing > 0:
+        one_hot = one_hot * (1.0 - smoothing) + smoothing / V
+    
+    loss = optax.softmax_cross_entropy(logits, one_hot)
+    mask = (jnp.arange(T)[None, :] < label_lengths[:, None]).astype(jnp.float32)
+    return (loss * mask).sum() / mask.sum()
+
+
+def make_train_step(args: TrainingArguments, blank_id: int, pad_id: int):
     @nnx.jit(donate_argnames=("model", "optimizer"))
     def train_step(model, optimizer, audios, labels, audio_lengths, label_lengths):
+        # Teacher forcing for decoder: Shift-right
+        # SOS = pad_id
+        dec_input = jnp.concatenate(
+            [jnp.full((labels.shape[0], 1), pad_id, dtype=labels.dtype), labels[:, :-1]],
+            axis=1,
+        )
+        dec_target = labels
+        dec_lengths = label_lengths
+
         def loss_fn(m):
-            logits, output_lengths = m(audios, audio_lengths, training=True)
-            return ctc_loss(logits, output_lengths, labels, label_lengths, blank_id)
+            out = m(audios, audio_lengths, labels=dec_input, training=True)
+            
+            # Main CTC Loss
+            l_ctc = ctc_loss(out["logits"], out["output_lengths"], labels, label_lengths, blank_id)
+            
+            # InterCTC Loss
+            if out["inter_logits"] is not None:
+                l_inter = ctc_loss(out["inter_logits"], out["output_lengths"], labels, label_lengths, blank_id)
+            else:
+                l_inter = 0.0
+                
+            # AED (Attention) Loss
+            l_aed = cross_entropy_loss(out["dec_logits"], dec_target, dec_lengths)
+            
+            # Hybrid Weighting
+            total = (1.0 - args.attention_weight) * l_ctc + args.attention_weight * l_aed
+            total = total + args.interctc_weight * l_inter
+            return total
 
         loss, grads = nnx.value_and_grad(loss_fn)(model)
         optimizer.update(model, grads)
@@ -74,12 +115,27 @@ def make_train_step(blank_id: int):
     return train_step
 
 
-def make_eval_step(blank_id: int):
+def make_eval_step(args: TrainingArguments, blank_id: int, pad_id: int):
     @nnx.jit
     def eval_step(model, audios, labels, audio_lengths, label_lengths):
-        logits, output_lengths = model(audios, audio_lengths, training=False)
-        loss = ctc_loss(logits, output_lengths, labels, label_lengths, blank_id)
-        return loss, logits, output_lengths
+        dec_input = jnp.concatenate(
+            [jnp.full((labels.shape[0], 1), pad_id, dtype=labels.dtype), labels[:, :-1]],
+            axis=1,
+        )
+        out = model(audios, audio_lengths, labels=dec_input, training=False)
+        
+        l_ctc = ctc_loss(out["logits"], out["output_lengths"], labels, label_lengths, blank_id)
+        if out["inter_logits"] is not None:
+            l_inter = ctc_loss(out["inter_logits"], out["output_lengths"], labels, label_lengths, blank_id)
+        else:
+            l_inter = 0.0
+        
+        l_aed = cross_entropy_loss(out["dec_logits"], labels, label_lengths)
+        
+        loss = (1.0 - args.attention_weight) * l_ctc + args.attention_weight * l_aed
+        loss = loss + args.interctc_weight * l_inter
+        
+        return loss, out["logits"], out["output_lengths"]
 
     return eval_step
 
@@ -165,8 +221,8 @@ def main():
     eval_loader = build_eval_loader(eval_source, tokenizer, args)
     optimizer, schedule = build_optimizer(args, model, total_steps)
 
-    train_step = make_train_step(int(tokenizer.blank_id))
-    eval_step = make_eval_step(int(tokenizer.blank_id))
+    train_step = make_train_step(args, int(tokenizer.blank_id), int(tokenizer.pad_id))
+    eval_step = make_eval_step(args, int(tokenizer.blank_id), int(tokenizer.pad_id))
 
     manager = ocp.CheckpointManager(
         os.path.abspath(args.checkpoint_dir),

@@ -42,9 +42,9 @@ def main():
         for batch_index, (audios, labels, audio_lengths, label_lengths) in enumerate(
             tqdm(test_loader, desc="Inference")
         ):
-            logits, output_lengths = forward(model, jnp.asarray(audios), jnp.asarray(audio_lengths))
-            logits_np = np.asarray(logits)
-            out_lens = np.asarray(output_lengths)
+            out = forward(model, jnp.asarray(audios), jnp.asarray(audio_lengths))
+            logits_np = np.asarray(out["logits"])
+            out_lens = np.asarray(out["output_lengths"])
             for i in range(logits_np.shape[0]):
                 pred = greedy_ctc_decode_text(logits_np[i], int(out_lens[i]), tokenizer)
                 gt = decode_token_ids(labels[i, : int(label_lengths[i])], tokenizer)

@@ -25,6 +25,23 @@ def _apply_rope(x, cos, sin):  # x: (B, T, H, D)
     )
 
 
+class DropPath(nnx.Module):
+    """Drop paths (Stochastic Depth) per sample when applied in main path of residual blocks."""
+
+    def __init__(self, drop_prob: float, rngs: nnx.Rngs):
+        self.drop_prob = drop_prob
+        self.rngs = rngs
+
+    def __call__(self, x, training: bool):
+        if not training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + jax.random.uniform(self.rngs.dropout(), shape, dtype=x.dtype)
+        binary_tensor = jnp.floor(random_tensor)
+        return x / keep_prob * binary_tensor
+
+
 class ConvSubsampler(nnx.Module):
     """Two stride-2 2D convs giving a 4× time downsample."""
 
@@ -135,6 +152,7 @@ class FastConformerBlock(nnx.Module):
         expansion: int,
         kernel: int,
         dropout: float,
+        stochastic_depth_prob: float,
         *,
         rngs: nnx.Rngs,
         dtype,
@@ -143,12 +161,13 @@ class FastConformerBlock(nnx.Module):
         self.attn = FlashAttention(d_model, num_heads, dropout, rngs=rngs, dtype=dtype)
         self.conv = ConvModule(d_model, kernel, dropout, rngs=rngs, dtype=dtype)
         self.ff2 = SwiGLUFFN(d_model, expansion, dropout, rngs=rngs, dtype=dtype)
+        self.drop_path = DropPath(stochastic_depth_prob, rngs=rngs)
 
     def __call__(self, x, cos, sin, lengths, mask1d, training: bool):
-        x = x + 0.5 * self.ff1(x, training)
-        x = x + self.attn(x, cos, sin, lengths, training)
-        x = x + self.conv(x, mask1d, training)
-        x = x + 0.5 * self.ff2(x, training)
+        x = x + self.drop_path(0.5 * self.ff1(x, training), training)
+        x = x + self.drop_path(self.attn(x, cos, sin, lengths, training), training)
+        x = x + self.drop_path(self.conv(x, mask1d, training), training)
+        x = x + self.drop_path(0.5 * self.ff2(x, training), training)
         return x
 
 
@@ -165,6 +184,8 @@ class FastConformerEncoder(nnx.Module):
         expansion: int,
         kernel: int,
         dropout: float,
+        stochastic_depth_prob: float,
+        interctc_layer: int,
         n_mels: int,
         sample_rate: int,
         n_fft: int,
@@ -186,16 +207,35 @@ class FastConformerEncoder(nnx.Module):
         freq_dim = ((n_mels - 3) // 2 + 1 - 3) // 2 + 1
         self.proj = nnx.Linear(d_model * freq_dim, d_model, rngs=rngs, dtype=dtype)
 
-        @nnx.split_rngs(splits=num_layers)
-        @nnx.vmap(in_axes=0, out_axes=0)
-        def make_block(rngs):
-            return FastConformerBlock(
-                d_model, num_heads, expansion, kernel, dropout, rngs=rngs, dtype=dtype
+        # Stochastic depth linear decay: 0 at layer 0, max at last layer
+        def get_drop_prob(layer_idx):
+            return stochastic_depth_prob * (layer_idx + 1) / num_layers
+
+        self.blocks = nnx.List([])
+        for i in range(num_layers):
+            self.blocks.append(
+                FastConformerBlock(
+                    d_model,
+                    num_heads,
+                    expansion,
+                    kernel,
+                    dropout,
+                    get_drop_prob(i),
+                    rngs=rngs,
+                    dtype=dtype,
+                )
             )
 
-        self.blocks = make_block(rngs)
         self.final_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
         self.head = nnx.Linear(d_model, vocab_size, rngs=rngs, dtype=dtype)
+
+        # InterCTC head
+        self.num_layers = num_layers
+        self.interctc_layer = interctc_layer
+        if 0 < interctc_layer < num_layers:
+            self.interctc_head = nnx.Linear(d_model, vocab_size, rngs=rngs, dtype=dtype)
+        else:
+            self.interctc_head = None
 
         self.d_model = d_model
         self.head_dim = d_model // num_heads
@@ -212,11 +252,165 @@ class FastConformerEncoder(nnx.Module):
         cos, sin = _rope_table(self.head_dim, T, self.dtype)
         mask1d = (jnp.arange(T)[None, :] < seq_len[:, None])[:, :, None].astype(x.dtype)
 
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
-        @nnx.remat
-        def run(x, block):
-            return block(x, cos, sin, seq_len, mask1d, training)
+        inter_logits = None
+        
+        # Manually iterate to capture intermediate state and avoid nnx.scan issues
+        for i, block in enumerate(self.blocks):
+            # Wrap in remat for memory efficiency
+            def block_fn(x_in, b=block):
+                return b(x_in, cos, sin, seq_len, mask1d, training)
+            
+            x = nnx.remat(block_fn)(x)
+            
+            if self.interctc_head is not None and i == self.interctc_layer - 1:
+                inter_logits = self.interctc_head(self.final_norm(x))
 
-        x = run(x, self.blocks)
+        x_enc = self.final_norm(x)
+        logits = self.head(x_enc)
+
+        return {
+            "logits": logits,
+            "inter_logits": inter_logits,
+            "encoder_states": x_enc,
+            "output_lengths": seq_len,
+        }
+
+
+class TransformerDecoderLayer(nnx.Module):
+    def __init__(self, d_model: int, num_heads: int, expansion: int, dropout: float, *, rngs: nnx.Rngs, dtype):
+        self.self_attn_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.self_attn = nnx.MultiHeadAttention(num_heads, d_model, dropout_rate=dropout, decode=False, rngs=rngs, dtype=dtype)
+        
+        self.cross_attn_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.cross_attn = nnx.MultiHeadAttention(num_heads, d_model, dropout_rate=dropout, decode=False, rngs=rngs, dtype=dtype)
+        
+        self.ffn = SwiGLUFFN(d_model, expansion, dropout, rngs=rngs, dtype=dtype)
+
+    def __call__(self, x, enc_states, self_mask, cross_mask, training: bool):
+        # Self-attention
+        h = self.self_attn_norm(x)
+        x = x + self.self_attn(h, mask=self_mask, deterministic=not training)
+        
+        # Cross-attention
+        h = self.cross_attn_norm(x)
+        x = x + self.cross_attn(h, enc_states, mask=cross_mask, deterministic=not training)
+        
+        # FFN
+        x = x + self.ffn(x, training)
+        return x
+
+
+class TransformerDecoder(nnx.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        expansion: int,
+        dropout: float,
+        *,
+        rngs: nnx.Rngs,
+        dtype,
+    ):
+        self.embed = nnx.Embed(vocab_size, d_model, rngs=rngs, dtype=dtype)
+        self.pos_embed = nnx.Embed(2048, d_model, rngs=rngs, dtype=dtype) # Max seq len
+        
+        self.layers = nnx.List([])
+        for _ in range(num_layers):
+            self.layers.append(
+                TransformerDecoderLayer(d_model, num_heads, expansion, dropout, rngs=rngs, dtype=dtype)
+            )
+            
+        self.final_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
+        self.head = nnx.Linear(d_model, vocab_size, rngs=rngs, dtype=dtype)
+        self.d_model = d_model
+
+    def __call__(self, labels, enc_states, enc_lengths, training: bool):
+        B, T_dec = labels.shape
+        T_enc = enc_states.shape[1]
+        
+        # Embeddings
+        x = self.embed(labels) * math.sqrt(self.d_model)
+        x = x + self.pos_embed(jnp.arange(T_dec)[None, :])
+        
+        # Masks
+        causal_mask = jnp.tril(jnp.ones((T_dec, T_dec)))
+        self_mask = causal_mask[None, None, :, :]
+        
+        cross_mask = (jnp.arange(T_enc)[None, :] < enc_lengths[:, None])[:, None, None, :]
+        
+        for layer in self.layers:
+            # Wrap in remat for memory efficiency
+            def layer_fn(x_in, l=layer):
+                return l(x_in, enc_states, self_mask, cross_mask, training)
+            x = nnx.remat(layer_fn)(x)
+            
         x = self.final_norm(x)
-        return self.head(x), seq_len
+        return self.head(x)
+
+
+class FastConformer(nnx.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        *,
+        d_model: int,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+        num_heads: int,
+        expansion: int,
+        kernel: int,
+        dropout: float,
+        stochastic_depth_prob: float,
+        interctc_layer: int,
+        n_mels: int,
+        sample_rate: int,
+        n_fft: int,
+        win_length: int,
+        hop_length: int,
+        dtype,
+        rngs: nnx.Rngs,
+    ):
+        self.encoder = FastConformerEncoder(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            num_layers=num_encoder_layers,
+            num_heads=num_heads,
+            expansion=expansion,
+            kernel=kernel,
+            dropout=dropout,
+            stochastic_depth_prob=stochastic_depth_prob,
+            interctc_layer=interctc_layer,
+            n_mels=n_mels,
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            win_length=win_length,
+            hop_length=hop_length,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.decoder = TransformerDecoder(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            num_layers=num_decoder_layers,
+            num_heads=num_heads,
+            expansion=expansion,
+            dropout=dropout,
+            dtype=dtype,
+            rngs=rngs,
+        )
+
+    def __call__(self, audio, audio_lengths, labels=None, training: bool = True):
+        enc_out = self.encoder(audio, audio_lengths, training=training)
+        
+        if labels is not None:
+            dec_logits = self.decoder(labels, enc_out["encoder_states"], enc_out["output_lengths"], training=training)
+        else:
+            dec_logits = None
+            
+        return {
+            **enc_out,
+            "dec_logits": dec_logits,
+        }
+

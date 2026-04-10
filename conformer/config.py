@@ -12,6 +12,15 @@ class TrainingArguments:
     feed_forward_expansion_factor: int = 4
     dropout: float = 0.1
     conv_kernel_size: int = 9
+    stochastic_depth_prob: float = 0.1
+
+    # InterCTC
+    interctc_layer: int = 8
+    interctc_weight: float = 0.3
+
+    # Decoder (Hybrid)
+    decoder_layers: int = 4
+    attention_weight: float = 0.2
 
     # Frontend
     sampling_rate: int = 16000
