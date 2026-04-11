@@ -36,6 +36,7 @@ class TrainingArguments:
     save_steps: int = 500
     save_total_limit: int = 5
     checkpoint_dir: str = "./checkpoints"
+    attn_impl: str | None = "cudnn"
 
     # Data — single fixed shape, no buckets
     data_dir: str = "/home/penguin/data/ka/packed_dataset"

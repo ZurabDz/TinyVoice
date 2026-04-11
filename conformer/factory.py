@@ -26,6 +26,7 @@ def build_model(args: TrainingArguments, tokenizer) -> FastConformerEncoder:
         hop_length=args.hop_length,
         dtype=args.dtype,
         rngs=nnx.Rngs(0),
+        attn_impl=args.attn_impl,
     )
 
 

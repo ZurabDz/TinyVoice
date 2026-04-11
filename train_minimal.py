@@ -73,6 +73,7 @@ def parse_args():
     t.add_argument("--save-steps", type=int)
     t.add_argument("--save-total-limit", type=int)
     t.add_argument("--checkpoint-dir", type=str)
+    t.add_argument("--attn-impl", type=str, choices=["cudnn", "xla", "none"], default=None)
 
     # Data
     d = parser.add_argument_group("data")
@@ -95,7 +96,12 @@ def build_training_args(cli) -> TrainingArguments:
     overrides = {}
     for key, value in vars(cli).items():
         if value is not None:
-            overrides[key] = dtype_map[value] if key == "dtype" else value
+            if key == "dtype":
+                overrides[key] = dtype_map[value]
+            elif key == "attn_impl":
+                overrides[key] = None if value == "none" else value
+            else:
+                overrides[key] = value
     return TrainingArguments(**overrides)
 
 
