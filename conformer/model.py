@@ -6,7 +6,8 @@ from flax import nnx
 
 from .mel import AudioToMelSpectrogram
 
-_ATTN_IMPL = "cudnn" if jax.devices()[0].platform == "gpu" else None
+# _ATTN_IMPL = "cudnn" if jax.devices()[0].platform == "gpu" else None
+_ATTN_IMPL = "cudnn"
 
 
 def _rope_table(head_dim: int, max_len: int, dtype):

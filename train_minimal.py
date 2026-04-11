@@ -1,10 +1,20 @@
 """Minimal end-to-end CTC training for the FastConformer ASR encoder."""
 
+import argparse
 import csv
 import itertools
 import os
 from pathlib import Path
 from statistics import mean
+
+# These are OFF by default; they enable cuDNN-accelerated kernels on Ampere+ GPUs.
+# Ignored on TPU/CPU (XLA only reads gpu flags on the GPU backend).
+# os.environ.setdefault("XLA_FLAGS", (
+#     "--xla_gpu_enable_cudnn_layer_norm=true "
+#     "--xla_gpu_use_runtime_fusion=true "
+#     "--xla_gpu_cudnn_gemm_fusion_level=2 "
+#     "--xla_gpu_fused_attention_use_cudnn_rng=true"
+# ))
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +33,70 @@ from conformer.tokenizer import Tokenizer
 
 DEV_MODE = os.environ.get("TINYVOICE_DEV", "0") == "1"
 DEV_STEPS = int(os.environ.get("TINYVOICE_DEV_STEPS", "10000"))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="TinyVoice FastConformer CTC training")
+
+    # Model
+    m = parser.add_argument_group("model")
+    m.add_argument("--d-model", type=int)
+    m.add_argument("--num-encoder-layers", type=int)
+    m.add_argument("--num-attention-heads", type=int)
+    m.add_argument("--feed-forward-expansion-factor", type=int)
+    m.add_argument("--dropout", type=float)
+    m.add_argument("--conv-kernel-size", type=int)
+
+    # Frontend
+    f = parser.add_argument_group("frontend")
+    f.add_argument("--sampling-rate", type=int)
+    f.add_argument("--n-fft", type=int)
+    f.add_argument("--win-length", type=int)
+    f.add_argument("--hop-length", type=int)
+    f.add_argument("--n-mels", type=int)
+
+    # Optimizer
+    o = parser.add_argument_group("optimizer")
+    o.add_argument("--grad-clip", type=float)
+    o.add_argument("--weight-decay", type=float)
+    o.add_argument("--lr-init-value", type=float)
+    o.add_argument("--lr-peak-value", type=float)
+    o.add_argument("--lr-warmup-steps", type=int)
+    o.add_argument("--lr-end-value", type=float)
+
+    # Training
+    t = parser.add_argument_group("training")
+    t.add_argument("--dtype", type=str, choices=["bfloat16", "float32", "float16"])
+    t.add_argument("--num-epochs", type=int)
+    t.add_argument("--batch-size", type=int)
+    t.add_argument("--log-steps", type=int)
+    t.add_argument("--save-steps", type=int)
+    t.add_argument("--save-total-limit", type=int)
+    t.add_argument("--checkpoint-dir", type=str)
+
+    # Data
+    d = parser.add_argument_group("data")
+    d.add_argument("--data-dir", type=str)
+    d.add_argument("--audio-frames-max", type=int)
+    d.add_argument("--label-length-max", type=int)
+    d.add_argument("--min-audio-seconds", type=float)
+    d.add_argument("--max-audio-seconds", type=float)
+    d.add_argument("--enable-speed-perturb", action=argparse.BooleanOptionalAction)
+    d.add_argument("--enable-additive-noise", action=argparse.BooleanOptionalAction)
+    d.add_argument("--enable-reverb", action=argparse.BooleanOptionalAction)
+    d.add_argument("--mp-prefetch-workers", type=int)
+    d.add_argument("--mp-prefetch-buffer", type=int)
+
+    return parser.parse_args()
+
+
+def build_training_args(cli) -> TrainingArguments:
+    dtype_map = {"bfloat16": jnp.bfloat16, "float32": jnp.float32, "float16": jnp.float16}
+    overrides = {}
+    for key, value in vars(cli).items():
+        if value is not None:
+            overrides[key] = dtype_map[value] if key == "dtype" else value
+    return TrainingArguments(**overrides)
 
 
 def configure_jax_cache():
@@ -174,7 +248,7 @@ def restore_checkpoint(manager, trainer):
 
 def main():
     configure_jax_cache()
-    args = TrainingArguments()
+    args = build_training_args(parse_args())
     if DEV_MODE:
         args.enable_speed_perturb = False
         args.enable_additive_noise = False

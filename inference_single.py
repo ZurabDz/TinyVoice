@@ -32,7 +32,7 @@ def main():
     )
 
     model = build_model(args, tokenizer)
-    model, latest_step = load_checkpoint(model, args.checkpoint_dir)
+    model, latest_step = load_checkpoint(model, args.checkpoint_dir, args=args, tokenizer=tokenizer)
     if latest_step is None:
         print("No checkpoints found.")
         sys.exit(1)

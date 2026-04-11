@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-os.environ["JAX_PLATFORMS"] = "cpu"
+# os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax.numpy as jnp
 import numpy as np
@@ -16,7 +16,7 @@ from conformer.factory import build_model, load_checkpoint
 from conformer.tokenizer import Tokenizer
 
 
-@nnx.jit
+# @nnx.jit
 def forward(model, audios, audio_lengths):
     return model(audios, audio_lengths, training=False)
 
@@ -28,7 +28,7 @@ def main():
     )
 
     model = build_model(args, tokenizer)
-    model, latest_step = load_checkpoint(model, args.checkpoint_dir)
+    model, latest_step = load_checkpoint(model, args.checkpoint_dir, args=args, tokenizer=tokenizer)
     if latest_step is None:
         print("No checkpoints found.")
         return
