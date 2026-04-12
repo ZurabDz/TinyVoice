@@ -7,6 +7,7 @@ from flax import nnx
 from .mel import AudioToMelSpectrogram
 
 
+
 def _rope_table(head_dim: int, max_len: int, dtype):
     inv = 1.0 / (10000.0 ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     t = jnp.arange(max_len, dtype=jnp.float32)
@@ -57,7 +58,7 @@ class SwiGLUFFN(nnx.Module):
         self.norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
         self.gate = nnx.Linear(d_model, hidden, use_bias=False, rngs=rngs, dtype=dtype)
         self.up = nnx.Linear(d_model, hidden, use_bias=False, rngs=rngs, dtype=dtype)
-        self.down = nnx.Linear(hidden, d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.down = nnx.Linear(hidden, d_model, use_bias=False, rngs=rngs, dtype=dtype, kernel_init=jax.nn.initializers.zeros)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
     def __call__(self, x, training: bool):
@@ -69,13 +70,14 @@ class SwiGLUFFN(nnx.Module):
 class FlashAttention(nnx.Module):
     """Pre-norm MHSA over fused QKV with RoPE and cuDNN flash attention."""
 
-    def __init__(self, d_model: int, num_heads: int, dropout: float, *, rngs: nnx.Rngs, dtype):
+    def __init__(self, d_model: int, num_heads: int, dropout: float, *, rngs: nnx.Rngs, dtype, attn_impl: str | None = None):
         assert d_model % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.attn_impl = attn_impl
         self.norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
         self.qkv = nnx.Linear(d_model, 3 * d_model, use_bias=False, rngs=rngs, dtype=dtype)
-        self.out = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.out = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype, kernel_init=jax.nn.initializers.zeros)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
     def __call__(self, x, cos, sin, lengths, training: bool):
@@ -89,7 +91,7 @@ class FlashAttention(nnx.Module):
             q, k, v,
             query_seq_lengths=lengths,
             key_value_seq_lengths=lengths,
-            implementation="cudnn",
+            implementation=self.attn_impl,
         )
         out = out.reshape(B, T, -1)
         return self.drop(self.out(out), deterministic=not training)
@@ -112,7 +114,7 @@ class ConvModule(nnx.Module):
             dtype=dtype,
         )
         self.act_norm = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype, param_dtype=jnp.float32)
-        self.pw2 = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype)
+        self.pw2 = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, dtype=dtype, kernel_init=jax.nn.initializers.zeros)
         self.drop = nnx.Dropout(dropout, rngs=rngs)
 
     def __call__(self, x, mask1d, training: bool):
@@ -138,9 +140,10 @@ class FastConformerBlock(nnx.Module):
         *,
         rngs: nnx.Rngs,
         dtype,
+        attn_impl: str | None = None,
     ):
         self.ff1 = SwiGLUFFN(d_model, expansion, dropout, rngs=rngs, dtype=dtype)
-        self.attn = FlashAttention(d_model, num_heads, dropout, rngs=rngs, dtype=dtype)
+        self.attn = FlashAttention(d_model, num_heads, dropout, rngs=rngs, dtype=dtype, attn_impl=attn_impl)
         self.conv = ConvModule(d_model, kernel, dropout, rngs=rngs, dtype=dtype)
         self.ff2 = SwiGLUFFN(d_model, expansion, dropout, rngs=rngs, dtype=dtype)
 
@@ -172,6 +175,7 @@ class FastConformerEncoder(nnx.Module):
         hop_length: int,
         dtype,
         rngs: nnx.Rngs,
+        attn_impl: str | None = None,
     ):
         self.frontend = AudioToMelSpectrogram(
             sample_rate=sample_rate,
@@ -190,7 +194,7 @@ class FastConformerEncoder(nnx.Module):
         @nnx.vmap(in_axes=0, out_axes=0)
         def make_block(rngs):
             return FastConformerBlock(
-                d_model, num_heads, expansion, kernel, dropout, rngs=rngs, dtype=dtype
+                d_model, num_heads, expansion, kernel, dropout, rngs=rngs, dtype=dtype, attn_impl=attn_impl
             )
 
         self.blocks = make_block(rngs)

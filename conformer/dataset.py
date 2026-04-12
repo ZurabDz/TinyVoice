@@ -133,7 +133,7 @@ def _pad_and_collate(batch, audio_frames_max: int, label_length_max: int, pad_id
 
 def _open_source(data_dir: str, split: str) -> grain.sources.ArrayRecordDataSource:
     return grain.sources.ArrayRecordDataSource(
-        str(Path(data_dir) / "packed_dataset" / f"{split}.array_record")
+        str(Path(data_dir) / f"{split}.array_record")
     )
 
 
@@ -169,7 +169,11 @@ def build_train_loader(train_source, tokenizer, args, num_epochs: int):
     iter_ds = (
         dataset.to_iter_dataset()
         .filter(FitsFixedShape(args.audio_frames_max, args.label_length_max))
-        .batch(batch_size=args.batch_size, batch_fn=_make_collator(args, tokenizer))
+        .batch(
+            batch_size=args.batch_size,
+            drop_remainder=True,
+            batch_fn=_make_collator(args, tokenizer),
+        )
     )
     return iter_ds.mp_prefetch(
         grain.MultiprocessingOptions(
@@ -184,7 +188,11 @@ def build_eval_loader(eval_source, tokenizer, args):
         eval_source.map(DecodeAndTokenize(tokenizer))
         .to_iter_dataset()
         .filter(FitsFixedShape(args.audio_frames_max, args.label_length_max))
-        .batch(batch_size=args.batch_size, batch_fn=_make_collator(args, tokenizer))
+        .batch(
+            batch_size=args.batch_size,
+            drop_remainder=True,
+            batch_fn=_make_collator(args, tokenizer),
+        )
     )
     return iter_ds.mp_prefetch(
         grain.MultiprocessingOptions(

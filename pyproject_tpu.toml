@@ -1,0 +1,24 @@
+[project]
+name = "tiny"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flax>=0.12.1",
+    "grain>=0.2.16",
+    "iprogress>=0.4",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
+    "jax[tpu]>=0.8.1",
+    "jiwer>=4.0.0",
+    "librosa>=0.11.0",
+    "pandas>=2.3.3",
+    "ruff>=0.15.2",
+    "setuptools<70",
+    "tensorboard-plugin-profile>=2.21.6",
+    "tensorflow>=2.20.0",
+    "tqdm>=4.67.1",
+    "tokenizers>=0.21.0",
+    "xprof>=2.21.3",
+]

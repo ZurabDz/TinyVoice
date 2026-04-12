@@ -36,9 +36,10 @@ class TrainingArguments:
     save_steps: int = 500
     save_total_limit: int = 5
     checkpoint_dir: str = "./checkpoints"
+    attn_impl: str | None = "cudnn"
 
     # Data — single fixed shape, no buckets
-    data_dir: str = "/home/penguin/data/ka"
+    data_dir: str = "/home/penguin/data/ka/packed_dataset"
     audio_frames_max: int = 176000  # 11 s @ 16 kHz
     label_length_max: int = 200
     min_audio_seconds: float = 1.0
