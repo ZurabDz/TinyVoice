@@ -16,7 +16,7 @@ from conformer.factory import build_model, load_checkpoint
 from conformer.tokenizer import Tokenizer
 
 
-# @nnx.jit
+@nnx.jit
 def forward(model, audios, audio_lengths):
     return model(audios, audio_lengths, training=False)
 
