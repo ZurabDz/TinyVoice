@@ -29,6 +29,7 @@ from conformer.config import TrainingArguments
 from conformer.dataset import build_data_sources, build_eval_loader, build_train_loader
 from conformer.decode import decode_token_ids, greedy_ctc_decode_text
 from conformer.factory import build_model
+from conformer.parallelism import build_mesh, shard_batch, shard_trainer_state
 from conformer.tokenizer import Tokenizer
 
 DEV_MODE = os.environ.get("TINYVOICE_DEV", "0") == "1"
@@ -183,13 +184,16 @@ def eval_step(model, audios, labels, audio_lengths, label_lengths, blank_id: int
     return loss, logits, output_lengths
 
 
-def run_validation(model, eval_loader, tokenizer, blank_id: int, max_batches=None):
+def run_validation(model, eval_loader, tokenizer, blank_id: int, mesh, max_batches=None):
     losses, refs, hyps = [], [], []
     for index, (audios, labels, audio_lengths, label_lengths) in enumerate(
         tqdm(eval_loader, desc="val", leave=False)
     ):
         if max_batches is not None and index >= max_batches:
             break
+        audios, labels, audio_lengths, label_lengths = shard_batch(
+            (audios, labels, audio_lengths, label_lengths), mesh
+        )
         loss, logits, output_lengths = eval_step(
             model, audios, labels, audio_lengths, label_lengths, blank_id
         )
@@ -255,6 +259,15 @@ def restore_checkpoint(manager, trainer):
 def main():
     configure_jax_cache()
     args = build_training_args(parse_args())
+
+    mesh = build_mesh()
+    n_devices = jax.device_count()
+    print(f"devices={n_devices}  mesh={mesh}")
+    if args.batch_size % n_devices != 0:
+        raise ValueError(
+            f"batch_size {args.batch_size} must be divisible by device_count {n_devices}"
+        )
+
     if DEV_MODE:
         args.enable_speed_perturb = False
         args.enable_additive_noise = False
@@ -280,6 +293,7 @@ def main():
     optimizer, schedule = build_optimizer(args, model, total_steps)
 
     trainer = Trainer(model, optimizer, ema_model, int(tokenizer.blank_id), schedule)
+    shard_trainer_state(trainer, mesh)
 
     manager = ocp.CheckpointManager(
         os.path.abspath(args.checkpoint_dir),
@@ -290,6 +304,7 @@ def main():
     )
 
     restored_step = restore_checkpoint(manager, trainer)
+    shard_trainer_state(trainer, mesh)
     if restored_step > 0:
         print(f"Restored from checkpoint at step {restored_step}")
     
@@ -319,6 +334,9 @@ def main():
             )
 
             for audios, labels, audio_lengths, label_lengths in progress:
+                audios, labels, audio_lengths, label_lengths = shard_batch(
+                    (audios, labels, audio_lengths, label_lengths), mesh
+                )
                 loss = trainer.train_step(audios, labels, audio_lengths, label_lengths)
                 global_step = int(trainer.step[...])
                 
@@ -339,7 +357,7 @@ def main():
             # Run validation at the end of epoch
             print(f"\nValidation after epoch {epoch + 1}...")
             val_loss, val_cer = run_validation(
-                trainer.ema_model, eval_loader, tokenizer, trainer.blank_id,
+                trainer.ema_model, eval_loader, tokenizer, trainer.blank_id, mesh,
                 max_batches=10 if DEV_MODE else None,
             )
             train_loss = mean(train_losses) if train_losses else 0.0
