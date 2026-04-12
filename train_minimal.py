@@ -185,12 +185,16 @@ def eval_step(model, audios, labels, audio_lengths, label_lengths, blank_id: int
 
 
 def run_validation(model, eval_loader, tokenizer, blank_id: int, mesh, max_batches=None):
+    n_devices = jax.device_count()
     losses, refs, hyps = [], [], []
     for index, (audios, labels, audio_lengths, label_lengths) in enumerate(
         tqdm(eval_loader, desc="val", leave=False)
     ):
         if max_batches is not None and index >= max_batches:
             break
+        if audios.shape[0] % n_devices != 0:
+            # Partial trailing batch — can't shard evenly across devices. Skip it.
+            continue
         audios, labels, audio_lengths, label_lengths = shard_batch(
             (audios, labels, audio_lengths, label_lengths), mesh
         )
