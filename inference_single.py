@@ -2,14 +2,14 @@ import os
 import sys
 from pathlib import Path
 
-os.environ["JAX_PLATFORMS"] = "cpu"
+# os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax.numpy as jnp
-import librosa
 import numpy as np
 from flax import nnx
 
 from conformer.config import TrainingArguments
+from conformer.audio import load_audio_file
 from conformer.decode import greedy_ctc_decode_text
 from conformer.factory import build_model, load_checkpoint
 from conformer.tokenizer import Tokenizer
@@ -26,7 +26,7 @@ def main():
         sys.exit(1)
 
     audio_path = sys.argv[1]
-    args = TrainingArguments()
+    args = TrainingArguments(attn_impl="xla")
     tokenizer = Tokenizer.load_tokenizer(
         Path(args.data_dir) / "tokenizer.pkl"
     )
@@ -38,8 +38,7 @@ def main():
         sys.exit(1)
     print(f"Restored checkpoint step {latest_step}")
 
-    audio, _ = librosa.load(audio_path, sr=args.sampling_rate)
-    audio = np.asarray(audio, dtype=np.float32)
+    audio = load_audio_file(audio_path, args.sampling_rate)
     print(f"Audio: {len(audio) / args.sampling_rate:.2f}s")
 
     audios = jnp.asarray(audio[None, :])

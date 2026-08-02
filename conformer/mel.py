@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import librosa
-import numpy as np
 from flax import nnx
 from jax.scipy.signal import stft
 

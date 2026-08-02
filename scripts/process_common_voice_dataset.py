@@ -1,7 +1,7 @@
 import pandas as pd
 from pathlib import Path
-import librosa
 import soundfile as sf
+import soxr
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
@@ -12,18 +12,23 @@ import numpy as np
 
 def resample_and_write(
     row: tuple, dst_path: Path
-) -> tuple[str, str | None | Exception, str | None, str | None, str | None]:
+) -> tuple[str, str | None | Exception, str | None, str | None, str | None, str | None]:
     """
     resamples given audio, writes it to destination and returns old path, error, new path, label, frames
     """
     try:
-        old_path, label = row[1].values
-        sig, _ = librosa.load(old_path, sr=16_000)
+        values = row[1]
+        old_path, label = values["path"], values["sentence"]
+        client_id = values.get("client_id")
+        sig, source_rate = sf.read(str(old_path), dtype="float32", always_2d=False)
+        if sig.ndim == 2:
+            sig = sig.mean(axis=1)
+        sig = soxr.resample(sig, source_rate, 16_000, quality="HQ").astype(np.float32)
         saved_path = dst_path / (old_path.stem + ".flac")
         sf.write(str(saved_path), sig, 16_000, format="FLAC")
-        return old_path, None, saved_path, label, sig.shape[0]
+        return old_path, None, saved_path, label, sig.shape[0], client_id
     except Exception as e:
-        return old_path, e, None, None, None
+        return old_path, e, None, None, None, None
 
 
 def process_tsv(
@@ -34,7 +39,7 @@ def process_tsv(
     dataset = pd.read_csv(
         filepath_or_buffer=root_path / tsv_filename,
         sep="\t",
-        usecols=["path", "sentence"],
+        usecols=lambda column: column in {"path", "sentence", "client_id"},
     )  # ty: ignore[no-matching-overload]
 
     # changing relative path to full path
@@ -46,6 +51,7 @@ def process_tsv(
         "path": [],
         "label": [],
         "frames": [],
+        "client_id": [],
     }
     with ProcessPoolExecutor(max_workers=max_workers) as workers:
         futures = {
@@ -53,7 +59,7 @@ def process_tsv(
             for row in dataset.iterrows()
         }
         for future in tqdm(as_completed(futures), total=len(futures)):
-            old_path, error, saved_path, label, frames = future.result()
+            old_path, error, saved_path, label, frames, client_id = future.result()
             if error:
                 print(
                     f"something wrong with processing an audio: {old_path}, error is: {error}"
@@ -64,9 +70,10 @@ def process_tsv(
             new_df_data_source["path"].append(saved_path)
             new_df_data_source["label"].append(label)
             new_df_data_source["frames"].append(frames)
+            new_df_data_source["client_id"].append(client_id)
 
     new_df = pd.DataFrame.from_dict(new_df_data_source)
-    processed_audios = new_df[["path", "label", "frames"]].copy()
+    processed_audios = new_df[["path", "label", "frames", "client_id"]].copy()
     remove_punct_map = dict.fromkeys(map(ord, string.punctuation + "–—“”„"))
     processed_audios["label"] = (
         processed_audios["label"]

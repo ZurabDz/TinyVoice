@@ -19,7 +19,10 @@ def write_array_record(df: pd.DataFrame, save_path: Path) -> None:
     for row in tqdm(df.itertuples(), total=len(df), desc=save_path.name):
         with open(row.path, "rb") as f:
             data = f.read()
-        writer.write(pack_speech_data(data, {"label": row.label, "frames": row.frames}))
+        metadata = {"label": row.label, "frames": row.frames}
+        if hasattr(row, "client_id") and pd.notna(row.client_id):
+            metadata["client_id"] = row.client_id
+        writer.write(pack_speech_data(data, metadata))
     writer.close()
 
 

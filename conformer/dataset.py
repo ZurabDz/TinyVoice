@@ -1,14 +1,14 @@
 import functools
-import io
 import pickle
 import struct
 from pathlib import Path
 
 import grain
 import numpy as np
-import soundfile as sf
 import soxr
 from scipy.signal import fftconvolve
+
+from .audio import load_audio_bytes
 
 
 def unpack_speech_data(combined: bytes) -> tuple[dict, bytes]:
@@ -31,13 +31,13 @@ class FilterByDuration(grain.transforms.Filter):
 
 
 class DecodeAndTokenize(grain.transforms.Map):
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, sample_rate: int):
         self.tokenizer = tokenizer
+        self.sample_rate = sample_rate
 
     def map(self, element: bytes):
         metadata, audio_bytes = unpack_speech_data(element)
-        with io.BytesIO(audio_bytes) as fh:
-            audio, _ = sf.read(fh, dtype="float32")
+        audio = load_audio_bytes(audio_bytes, self.sample_rate)
         return {
             "audio": np.asarray(audio, dtype=np.float32),
             "label": self.tokenizer.encode(metadata["label"]),
@@ -163,7 +163,7 @@ def build_train_loader(train_source, tokenizer, args, num_epochs: int):
     dataset = (
         train_source.repeat(num_epochs=num_epochs)
         .shuffle(seed=42)
-        .map(DecodeAndTokenize(tokenizer))
+        .map(DecodeAndTokenize(tokenizer, args.sampling_rate))
     )
     dataset = _augmented(dataset, args, seed=1234)
     iter_ds = (
@@ -185,7 +185,7 @@ def build_train_loader(train_source, tokenizer, args, num_epochs: int):
 
 def build_eval_loader(eval_source, tokenizer, args):
     iter_ds = (
-        eval_source.map(DecodeAndTokenize(tokenizer))
+        eval_source.map(DecodeAndTokenize(tokenizer, args.sampling_rate))
         .to_iter_dataset()
         .filter(FitsFixedShape(args.audio_frames_max, args.label_length_max))
         .batch(

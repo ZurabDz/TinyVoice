@@ -317,8 +317,18 @@ def main():
     # For simplicity in this minimal script, we start from the current global step.
     
     train_loader_iter = iter(train_loader)
-    # If we restored, we might want to skip batches, but Grain MapDataset is better for that.
-    # Here we just continue.
+    # Grain's iterator is freshly created on restart.  Consume the batches
+    # already represented by the restored global step so an interrupted run
+    # does not silently replay the beginning of the corpus.
+    if 0 < restored_step < total_steps:
+        print(f"Skipping {restored_step} already-trained batches...")
+        for _ in range(restored_step):
+            try:
+                next(train_loader_iter)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "checkpoint step exceeds the available repeated training dataset"
+                ) from exc
 
     global_step = int(trainer.step[...])
 

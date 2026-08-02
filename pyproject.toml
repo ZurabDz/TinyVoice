@@ -21,4 +21,5 @@ dependencies = [
     "tqdm>=4.67.1",
     "tokenizers>=0.21.0",
     "xprof>=2.21.3",
+    "jax2onnx>=0.15.0",
 ]
