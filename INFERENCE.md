@@ -170,9 +170,9 @@ python scripts/npu_compare.py artifacts/npu/tinyvoice
 ```
 comparing 130 valid frames of 274
 
-float32 : ამ დროიდან იწყება კათოლიკობის გავრცელებას საფრცხესაათავბაგოში
+float32 : სკოლაში მეჩიურ ფეხბურთის გუნდის წევრი და მოსწავლეთა საბჭოს პრეზიდენტი იყო
 
-int16   : ამ დროიდან იწყება კათოლიკობის გავრცელებას საფრცხესაათავბაგოში
+int16   : სკოლაში მეჩიურ ფეხბურთის გუნდის წევრი და მოსწავლეთა საბჭოს პრეზიდენტი იყო
           cosine=0.999896  frame_argmax_agreement=100.00%  max_abs_err=0.5794
 ```
 
@@ -317,7 +317,7 @@ viplite init OK.
 VIP cid=0x1000003b, device_count=1
 awnn_create total: 95.47 ms.
   vip_run_network: 174.79 ms.
-transcription: ამ დროიდან იწყება კათოლიკობის გავრცელებას საფრცხესაათავბაგოში
+transcription: სკოლაში მეჩიურ ფეხბურთის გუნდის წევრი და მოსწავლეთა საბჭოს პრეზიდენტი იყო
 ```
 
 `VIP cid` must match the `hex` you checked in Step 2. The diagnostic lines come
