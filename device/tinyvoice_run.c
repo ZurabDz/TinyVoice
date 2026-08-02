@@ -28,6 +28,10 @@
 #include <time.h>
 
 #include <awnn_lib.h>
+/* Reaches past the awnn wrapper for the VIPLite network handle, so the
+ * benchmark can read the hardware's own inference timer and cycle counter
+ * (VIP_NETWORK_PROP_PROFILING).  Nothing else in this file needs it. */
+#include <awnn_internal.h>
 
 #include "tinyvoice_frontend.h"
 #include "tinyvoice_model.h"
@@ -130,6 +134,10 @@ int main(int argc, char **argv)
     if (!collected) { fprintf(stderr, "out of memory\n"); return 1; }
 
     Stat frontend = {0}, quantise = {0}, encoder = {0}, decode = {0};
+    /* Hardware-reported busy time and cycles, as opposed to the wall clock
+     * around awnn_run() which also includes driver and buffer overhead. */
+    double hw_us_total = 0.0, hw_cycles_total = 0.0;
+    int hw_samples = 0;
     int temp_before = npu_temp_millicelsius();
     double wall_start = now_ms();
 
@@ -168,6 +176,14 @@ int main(int argc, char **argv)
             awnn_set_input_buffers(context, inputs);
             awnn_run(context);
             float **outputs = awnn_get_output_buffers(context);
+
+            vip_inference_profile_t profile = {0};
+            if (vip_query_network(context->network, VIP_NETWORK_PROP_PROFILING,
+                                  &profile) == VIP_SUCCESS && profile.inference_time) {
+                hw_us_total += profile.inference_time;
+                hw_cycles_total += profile.total_cycle;
+                hw_samples++;
+            }
 
             double t3 = now_ms();
             for (int t = 0; t < valid_out; t++) {
@@ -223,6 +239,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "  full-window rate  %7.1fx  (%.0f s audio/s if windows were full)\n",
                 (double)(repeat * windows) * window_seconds / (wall / 1e3),
                 (double)(repeat * windows) * window_seconds / (wall / 1e3));
+        if (hw_samples) {
+            double hw_ms = hw_us_total / hw_samples / 1e3;
+            fprintf(stderr, "  ---\n");
+            fprintf(stderr, "  NPU hardware time %7.2f ms/window  (driver reports)\n", hw_ms);
+            fprintf(stderr, "  NPU cycles        %7.2f M/window   (%.0f MHz effective)\n",
+                    hw_cycles_total / hw_samples / 1e6,
+                    hw_cycles_total / hw_us_total);
+            fprintf(stderr, "  NPU busy          %7.1f%% of wall clock\n",
+                    100.0 * (hw_us_total / 1e3) / wall);
+        }
         if (temp_before >= 0 && temp_after >= 0)
             fprintf(stderr, "  NPU temperature   %7.1f C -> %.1f C\n",
                     temp_before / 1000.0, temp_after / 1000.0);

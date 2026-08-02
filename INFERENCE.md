@@ -361,19 +361,41 @@ cd ~/Documents/zura/TinyVoice/artifacts/npu/tinyvoice
 
 ```
 === 100 iterations x 1 window(s) ===
-  model load          94.64 ms  (once, excluded below)
-  frontend (STFT)      44.52 ms  (min  31.83  max  50.72)   20.3% of wall
-  quantise input        0.37 ms  (min   0.36  max   0.39)    0.2% of wall
-  NPU encoder         174.55 ms  (min 174.31  max 175.46)   79.5% of wall
-  argmax + collect      0.07 ms  (min   0.02  max   0.10)    0.0% of wall
+  model load          99.56 ms  (once, excluded below)
+  frontend (STFT)      42.71 ms  (min  32.05  max  49.53)   19.6% of wall
+  quantise input        0.37 ms  (min   0.36  max   0.38)    0.2% of wall
+  NPU encoder         174.83 ms  (min 174.32  max 176.38)   80.2% of wall
+  argmax + collect      0.07 ms  (min   0.02  max   0.09)    0.0% of wall
   ---
-  wall                21.95 s
+  wall                21.80 s
   audio processed    608.40 s
-  realtime factor      27.7x  (this clip)
-  throughput           4.56 windows/s
-  full-window rate     50.1x  (50 s audio/s if windows were full)
-  NPU temperature      37.9 C -> 43.1 C
+  realtime factor      27.9x  (this clip)
+  throughput           4.59 windows/s
+  full-window rate     50.5x  (50 s audio/s if windows were full)
+  ---
+  NPU hardware time  174.34 ms/window  (driver reports)
+  NPU cycles         175.68 M/window   (1008 MHz effective)
+  NPU busy             80.0% of wall clock
+  NPU temperature      38.8 C -> 44.3 C
 ```
+
+The NPU stage is reproducible to well under a percent. Two independent runs of
+the command above, one from a cool board and one after half an hour of
+continuous benchmarking:
+
+| | cool start (38.8 C) | warm start (48.7 C) |
+|---|---|---|
+| NPU encoder | 174.83 ms | 174.55 ms |
+| NPU hardware time | 174.34 ms | 174.51 ms |
+| NPU cycles | 175.68 M | 175.87 M |
+| NPU busy | 80.0 % | 79.5 % |
+| throughput | 4.59 windows/s | 4.56 windows/s |
+| frontend (CPU) | 42.71 ms | 44.52 ms |
+
+The 0.15 % spread on the NPU stage is the useful signal here: the accelerator's
+timing does not depend on thermal state at this duty cycle. The CPU frontend is
+the noisier of the two, which is what you would expect from a scheduler moving
+work between the A55 and A76 clusters.
 
 Quote **windows/s**, not the realtime factor of one clip. A window costs the
 same whether it holds 2 s of speech or 11 s, so a short test clip understates
@@ -426,6 +448,110 @@ for N in 1 2 3; do
 done
 ```
 
+### Confirming the encoder really runs on the NPU
+
+Worth checking rather than assuming, since a silent CPU fallback would look
+like "it works, just slowly". Compare wall clock against CPU actually consumed:
+
+```bash
+TIMEFORMAT="real %R s   user %U s   sys %S s"
+time ../../../device/tinyvoice_run tinyvoice_int16.nb device/filterbank.bin \
+     device/vocab.txt sample_1.wav --repeat 100 --quiet >/dev/null 2>/dev/null
+```
+
+```
+real 21.799 s   user 4.141 s   sys 0.071 s
+```
+
+The process burns 4.2 s of CPU across 21.8 s of wall clock -- it is blocked for
+81 % of the run. And 4.141 s / 100 = 41 ms per iteration, which is the frontend
+time; the 175 ms encoder consumes essentially no CPU. Were it running on the
+CPU, user time would track wall clock instead.
+
+Three other things corroborate it:
+
+- the process holds `/dev/vipcore` open (`ls -l /proc/<pid>/fd`)
+- the driver enumerates real hardware at startup: `VIP cid=0x1000003b,
+  device_count=1, core_count=1`, and that id matches what the `.nb` was
+  compiled for
+- throughput plateaus at two workers. On an 8-core board a CPU-bound encoder
+  would keep scaling; plateauing means one shared serial resource, the NPU's
+  single core
+
+### What runs where
+
+| Stage | Runs on | Cost per 11 s window |
+|---|---|---|
+| WAV decode | CPU | negligible |
+| STFT, mel, normalise | CPU | 70 ms |
+| quantise to int16 | CPU | 0.4 ms |
+| **16-layer Conformer encoder** | **NPU** | **175 ms** |
+| argmax + CTC collapse | CPU | 0.1 ms |
+
+The NPU is a VeriSilicon VIP9000 block inside the A733 -- not a TPU, which is
+Google hardware and only relevant to training this model, not running it.
+
+### Monitoring the NPU
+
+**btop and htop will not show it.** They cover CPU, memory, disk, network and
+NVIDIA/AMD/Intel GPUs; nothing in the distro knows about a VeriSilicon VIP9000.
+The `vipcore` driver exposes no utilisation counter in sysfs either, so there is
+no file to read for a "% busy" gauge. Three things are available instead.
+
+**1. Live system view.** `device/npu_top.sh` shows temperature, clock and which
+processes hold `/dev/vipcore` open:
+
+```bash
+~/Documents/zura/TinyVoice/device/npu_top.sh 1
+```
+
+```
+17:34:24  NPU 54 C  clk 1008 MHz (performance)  CPU 55 C  GPU 53 C  in-use: tinyvoice_run(57209)
+```
+
+Note the governor is `performance`: the NPU sits at 1008 MHz permanently and
+never scales, so the clock reading tells you nothing about load. `in-use` and
+the temperature are the useful columns. Run it as root to see processes
+belonging to other users.
+
+**2. Real utilisation, from the hardware itself.** VIPLite exposes a per-network
+profiling counter (`VIP_NETWORK_PROP_PROFILING` → `inference_time`,
+`total_cycle`), which `tinyvoice_run --repeat` reads and reports:
+
+```
+  NPU hardware time  174.34 ms/window  (driver reports)
+  NPU cycles         175.68 M/window   (1008 MHz effective)
+  NPU busy             80.0% of wall clock
+```
+
+This is the number to trust. The driver's own timer (174.34 ms) agrees with the
+wall clock measured around `awnn_run()` (174.83 ms) to within half a
+millisecond, which is the driver and buffer overhead. 175.68 M cycles at
+174.34 ms works out to 1008 MHz, exactly the devfreq clock -- so the counter is
+a genuine hardware cycle count, not a software estimate.
+
+"NPU busy 80.0 %" is the utilisation figure a btop-style gauge would show. The
+missing 20 % is the CPU frontend, which runs serially ahead of it -- the reason
+[two workers](#step-8-benchmark-and-stress-test) push it to ~99 %.
+
+**3. Driver internals, as root.** `/sys/kernel/debug/viplite/` has more, though
+most of it is aimed at debugging rather than monitoring:
+
+| Node | Contents |
+|---|---|
+| `vip_info` | `pid=0x1000003b, date=0x20230518, ver1=0x9000, ver2=0x9202` |
+| `vip_freq` | core and PPU clocks; reads back the DVFS percentage while busy |
+| `rt_net_profile` | per-layer runtime profiling |
+| `mem_profile`, `mem_mapping` | memory pool accounting |
+| `pc_value`, `register_rw` | program counter and raw register access |
+
+```bash
+sudo cat /sys/kernel/debug/viplite/vip_info
+```
+
+Do not read `register_rw` or `pc_value` on a live workload unless you know what
+you are poking.
+
 ### Headline numbers
 
 | | |
@@ -434,7 +560,8 @@ done
 | Single-stream throughput | 4.1 windows/s = 45× realtime |
 | Single-stream latency | 245 ms per 11 s window |
 | Cold start | ~100 ms to load the 49 MB network, once per process |
-| Sustained NPU temperature | 38 °C idle → 49 °C under continuous load |
+| NPU busy (1 worker) | 80.0 % of wall clock, hardware-measured |
+| Sustained NPU temperature | 38 °C idle → 60 °C under continuous load, no throttling |
 
 In practical terms: one A7S transcribes roughly **an hour of audio per minute**,
 or keeps up with about 60 simultaneous realtime audio streams.

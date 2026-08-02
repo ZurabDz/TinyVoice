@@ -39,7 +39,11 @@ INCLUDE += -I. -I$(MODEL_DIR) -I$(AI_SDK_ROOT) \
            -I$(EXAMPLES)/libawnn_viplite -I$(EXAMPLES)/libawutils -I$(VIPLITE)/inc
 SRCS    += tinyvoice_run.c tinyvoice_frontend.c \
            $(EXAMPLES)/libawnn_viplite/awnn_lib.c $(EXAMPLES)/libawnn_viplite/awnn_quantize.c
-CFLAGS  += -O2 -Wall
+# -fcommon: awnn_internal.h carries tentative definitions of its timing globals
+# rather than extern declarations.  That is fine for the SDK, which includes it
+# from one file, but tinyvoice_run.c includes it too (for the VIPLite network
+# handle), and gcc >= 10 defaults to -fno-common and rejects the duplicate.
+CFLAGS  += -O2 -Wall -fcommon
 
 # v2.0 boards link the NBG linker/HAL pair; v1.13 boards the older VIPLite pair.
 # The rpath lets the binary find them without LD_LIBRARY_PATH -- they live in
